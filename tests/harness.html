@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FP400 map harness</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: Roboto, system-ui, sans-serif; background: #e9e9e9; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; align-items: start; }
+  .slot { border-radius: 12px; overflow: hidden; }
+  .slot h4 { margin: 0; padding: 6px 12px; font-size: 12px; font-weight: 500; }
+  .light { --primary-text-color: #141414; --secondary-text-color: #5e5e5e; --card-background-color: #ffffff; --divider-color: rgba(0,0,0,.12); --primary-color: #009ac7; background: #fff; color: #141414; }
+  .dark { --primary-text-color: #e1e1e1; --secondary-text-color: #9b9b9b; --card-background-color: #1c1c1c; --divider-color: rgba(225,225,225,.12); --primary-color: #009ac7; background: #1c1c1c; color: #e1e1e1; }
+  #result { white-space: pre-wrap; font: 12px/16px ui-monospace, monospace; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="grid" id="grid"></div>
+<pre id="result"></pre>
+<script type="module">
+// Replays Zigbee2MQTT messages (made up: tests/make-fixtures.mjs) into the card through a fake `hass`, with a fake
+// Zigbee2MQTT behind `/set`.
+//   ?frame=N         stop the replay at fixture N (after the frames before it, so trails show); without it, it loops
+//   ?scenario=edit   then drive the zone editor of the first card with pointer events and report PASS/FAIL in #result
+//                    (lounge only: it relies on the lounge's zones)
+//   ?config=NAME     card config from examples/NAME.json (default lounge)
+//   ?fixtures=NAME   messages from fixtures/NAME.json (default payloads, the lounge's)
+//   ?software=1      the device publishes software zones (its software_zones option on); =demo adds two zones
+//   ?scenario=software|settings|dot|view   the 0.4.0 features (lounge); view drops the room and the rotation
+//   ?scenario=zones&config=study&fixtures=no-zones   a sensor that never had a zone
+import {cellsAround, inSoftwareZone, parseSoftwareZone, viewTransform} from "../fp400-map-card.js";
+
+const params = new URLSearchParams(location.search);
+const fixtures = await (await fetch(`./fixtures/${params.get("fixtures") || "payloads"}.json`)).json();
+const config = await (await fetch(`../examples/${params.get("config") || "lounge"}.json`)).json();
+const stop = params.has("frame") ? Number(params.get("frame")) : null;
+const start = stop === null ? 0 : Math.max(0, stop - 12);
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const DEVICE = config.entity_prefix;
+// Zigbee2MQTT's base topic and the device's name in it, as the card works them out.
+const BASE = config.base_topic || config.topic.split("/")[0];
+const NAME = config.topic.slice(BASE.length + 1);
+const scenario = params.get("scenario");
+// settings and view run without a card rotation (the map must stay unturned); view also has no room outline.
+if (scenario === "settings" || scenario === "view") delete config.rotation;
+if (scenario === "view") delete config.room;
+
+function statesFrom(p) {
+    const now = new Date().toISOString();
+    const s = (state) => ({state: String(state), last_updated: now, last_reported: now, attributes: {}});
+    const states = {
+        [`binary_sensor.${DEVICE}_occupancy_1`]: s(p.occupancy_1 ? "on" : "off"),
+        [`sensor.${DEVICE}_human_count`]: s(p.human_count),
+        [`sensor.${DEVICE}_target_count`]: s(p.target_count),
+        [`sensor.${DEVICE}_tracking_status`]: s(p.tracking_status),
+        [`sensor.${DEVICE}_targets_xy`]: s(p.targets_xy),
+        [`text.${DEVICE}_edge_mask_hex`]: s(p.edge_mask_hex),
+        [`text.${DEVICE}_entry_exit_mask_hex`]: s(p.entry_exit_mask_hex),
+        [`text.${DEVICE}_interference_mask_hex`]: s(p.interference_mask_hex),
+    };
+    // configured_zones_compact as the converter publishes it, worked out from configured_zones.
+    if (Array.isArray(p.configured_zones)) {
+        const compact = p.configured_zones.map((z) => {
+            const hex = z.mask_hex.replace(/(00)+$/, "");
+            const start = hex.match(/^(00)*/)[0].length / 2;
+            return `${z.zone_id}${z.enabled === false ? "!" : ""}:${start}:${hex.slice(start * 2) || "00"}`;
+        });
+        states[`sensor.${DEVICE}_configured_zones_compact`] = s(compact.join(";") || "none");
+    }
+    // Zones the sensor has; Home Assistant shows the others as unknown, which the card leaves out.
+    for (let n = 1; n <= 8; n++) {
+        if (p[`native_zone_${n}_occupancy`] === undefined) continue;
+        states[`binary_sensor.${DEVICE}_native_zone_${n}_occupancy`] = s(p[`native_zone_${n}_occupancy`] ? "on" : "off");
+        states[`sensor.${DEVICE}_native_zone_${n}_count`] = s(p[`native_zone_${n}_count`]);
+    }
+    // Software zones (the device's software_zones option on): Home Assistant shows null as unknown.
+    for (let n = 1; n <= 8; n++) {
+        const config = p[`software_zone_${n}_config`];
+        if (config === undefined) continue;
+        const occupied = p[`software_zone_${n}_occupancy`];
+        states[`text.${DEVICE}_software_zone_${n}_config`] = s(config);
+        states[`binary_sensor.${DEVICE}_software_zone_${n}_occupancy`] = s(occupied == null ? "unknown" : occupied ? "on" : "off");
+        states[`sensor.${DEVICE}_software_zone_${n}_count`] = s(p[`software_zone_${n}_count`] ?? "unknown");
+        states[`sensor.${DEVICE}_software_zone_${n}_activity`] = s(p[`software_zone_${n}_activity`] ?? "unknown");
+    }
+    if (p.installation_mode) states[`select.${DEVICE}_installation_mode`] = s(p.installation_mode);
+    // An entity an older converter left behind; the card must ignore it.
+    if (p.map_rotation != null) states[`number.${DEVICE}_map_rotation`] = s(p.map_rotation);
+    return states;
+}
+
+/* ── Fake MQTT: listeners per topic, and a fake Zigbee2MQTT applying `/set` the way the real one does ── */
+const listeners = new Map(); // topic → Set(callback)
+const published = [];
+let current = structuredClone(fixtures[start].payload);
+window.__failNext = null; // a message for the next write to fail with
+function emit(topic, payload) {
+    for (const cb of [...(listeners.get(topic) || [])]) cb({topic, payload: JSON.stringify(payload), qos: 0, retain: false});
+}
+// Values Zigbee2MQTT learned from a `/get` stay in its state, so every later message carries them.
+const sticky = {};
+/** The device's state as Zigbee2MQTT publishes it; software zones follow the targets, as the converter works them out. */
+function fullState() {
+    const state = {...current, ...sticky};
+    for (let n = 1; n <= 8; n++) {
+        const key = `software_zone_${n}_config`;
+        if (!(key in state)) continue;
+        const zone = parseSoftwareZone(state[key]);
+        const inside = zone && Array.isArray(state.targets) ? state.targets.filter((t) => inSoftwareZone(t, zone)) : [];
+        Object.assign(state, {
+            [`software_zone_${n}_available`]: Boolean(zone),
+            [`software_zone_${n}_occupancy`]: zone ? inside.length > 0 : null,
+            [`software_zone_${n}_count`]: zone ? inside.length : null,
+            [`software_zone_${n}_activity`]: zone && inside.length ? (inside.some((t) => t.speed) ? "moving" : "still") : null,
+        });
+    }
+    return state;
+}
+function emitState() {
+    emit(config.topic, fullState());
+}
+if (params.has("software") || scenario === "software" || scenario === "dot") {
+    for (let n = 1; n <= 8; n++) sticky[`software_zone_${n}_config`] = "clear";
+    if (params.get("software") === "demo") {
+        sticky.software_zone_1_config = JSON.stringify({name: "Dining", x_min: 20, x_max: 140, y_min: 30, y_max: 160, absence_timeout: 3});
+        sticky.software_zone_2_config = JSON.stringify({name: "Walkway", x_min: -60, x_max: 40, y_min: 200, y_max: 380, absence_timeout: 3, rotation: 20});
+    }
+}
+// Kept by the converter; restore_status as the converter may publish it.
+if (scenario === "settings" || scenario === "view") Object.assign(sticky, {forget_still_targets: 0, restore_status: "ok", restore_error: ""});
+/** `/get` of the zone list on a sensor without zones, answered as a real sensor without zones answers it. */
+async function fakeGet(payload) {
+    await wait(100);
+    if ("configured_zones" in payload && !current.configured_zones) {
+        Object.assign(sticky, {configured_zones: [], configured_zone_count: 0, native_zone_endpoints: []});
+    }
+    emitState();
+}
+async function fakeZ2m(payload) {
+    const [key] = Object.keys(payload);
+    await wait(150);
+    // As Zigbee2MQTT sends it: the namespace is a prefix of the message.
+    const fail = (reason) => emit(`${BASE}/bridge/logging`, {level: "error", message: `z2m: Publish 'set' '${key}' to '${NAME}' failed: 'Error: ${reason}'`});
+    if (window.__failNext) {
+        const reason = window.__failNext;
+        window.__failNext = null;
+        return fail(reason);
+    }
+    const next = structuredClone(current);
+    if (/^software_zone_\d_config$/.test(key)) {
+        // The converter keeps the zones itself and publishes all eight again, each zone as JSON.stringify of what it parsed.
+        if (!(key in sticky)) return fail("Turn on the software_zones option first");
+        const zone = parseSoftwareZone(payload[key]);
+        if (zone === undefined) return fail("A software zone is an object with name, x_min, x_max, y_min and y_max, or clear");
+        sticky[key] = zone ? JSON.stringify(zone) : "clear";
+        return emitState();
+    }
+    if ("remove_target" in payload) {
+        // No state comes back: the sensor drops the target, and the next position report goes without it.
+        if (!Array.isArray(current.targets)) return fail("remove_target needs the tracking option");
+        next.targets = next.targets.filter((t) => t.id !== payload.remove_target);
+        next.target_count = next.targets.length;
+        next.targets_xy = next.targets.map((t) => `${t.id}:${t.x}:${t.y}`).join(";") || "none";
+    } else if ("spatial_learning" in payload) {
+        Object.assign(sticky, {learning_state: "accepted", learning_result_code: null});
+        emitState();
+        setTimeout(() => {
+            Object.assign(sticky, {learning_state: "result_received", learning_result_code: 0});
+            emitState();
+        }, 800);
+        return;
+    } else if (payload.native_zone) {
+        const {zone_id, mask_hex} = payload.native_zone;
+        // Like the sensor: a publish with the old list first (another message in flight), then the confirmed one.
+        emitState();
+        await wait(200);
+        next.configured_zones = next.configured_zones.filter((z) => z.zone_id !== zone_id).concat({enabled: true, mask_hex, zone_id, zone_type: 0}).sort((a, b) => a.zone_id - b.zone_id);
+        next[`zone_${zone_id}_sensitivity`] ??= "medium";
+        next[`zone_${zone_id}_absence_timeout`] ??= 10;
+    } else if (payload.native_zone_remove) {
+        next.configured_zones = next.configured_zones.filter((z) => z.zone_id !== payload.native_zone_remove);
+    } else {
+        // zone_N_sensitivity / zone_N_absence_timeout and the device settings come back as sent; the converter's own
+        // settings (forget_still_targets) stay in its state.
+        for (const [k, v] of Object.entries(payload)) {
+            if (k in sticky) sticky[k] = v;
+            else next[k] = v;
+        }
+    }
+    current = next;
+    emitState();
+}
+
+const cards = [];
+function makeCard(label, {admin, dark}) {
+    const slot = document.createElement("div");
+    slot.className = `slot ${dark ? "dark" : "light"}`;
+    slot.innerHTML = `<h4>${label}</h4>`;
+    const card = document.createElement("fp400-map-card");
+    card.setConfig(config);
+    const hass = {
+        user: {is_admin: admin},
+        themes: {darkMode: dark},
+        states: statesFrom(fullState()),
+        connection: {
+            async subscribeMessage(cb, msg) {
+                if (!admin) throw {code: "unauthorized", message: "Unauthorized"};
+                if (!listeners.has(msg.topic)) listeners.set(msg.topic, new Set());
+                listeners.get(msg.topic).add(cb);
+                return () => listeners.get(msg.topic).delete(cb);
+            },
+        },
+        async callService(domain, service, data) {
+            published.push({domain, service, ...data});
+            if (domain === "mqtt" && service === "publish" && data.topic === `${config.topic}/set`) fakeZ2m(JSON.parse(data.payload));
+            if (domain === "mqtt" && service === "publish" && data.topic === `${config.topic}/get`) fakeGet(JSON.parse(data.payload));
+        },
+    };
+    card.hass = hass;
+    slot.appendChild(card);
+    document.getElementById("grid").appendChild(slot);
+    cards.push({card, hass, admin});
+}
+
+makeCard("Admin, light: live from MQTT", {admin: true, dark: false});
+makeCard("Admin, dark: live from MQTT", {admin: true, dark: true});
+makeCard("Non-admin, light: reduced view", {admin: false, dark: false});
+makeCard("Non-admin, dark: reduced view", {admin: false, dark: true});
+
+await wait(300);
+let i = start;
+await new Promise((resolve) => {
+    function step() {
+        current = structuredClone(fixtures[i].payload);
+        emitState();
+        for (const c of cards) if (!c.admin) c.card.hass = {...c.hass, states: statesFrom(fullState())};
+        if (stop !== null && i >= stop) return resolve();
+        i = (i + 1) % fixtures.length;
+        setTimeout(step, stop === null ? 400 : 20);
+    }
+    step();
+});
+
+if (params.get("scenario") === "edit") await editScenario(cards[0].card);
+if (params.get("scenario") === "zones") await zonesScenario(cards[0].card);
+if (params.get("scenario") === "areas") await areasScenario(cards[0].card);
+if (scenario === "software") await softwareScenario(cards[0].card);
+if (scenario === "settings") await settingsScenario(cards[0].card);
+if (scenario === "dot") await dotScenario(cards[0].card);
+if (scenario === "view") await viewScenario(cards[0].card);
+
+/* ── The area editor, leaving targets and zone outlines in the reduced view (lounge) ── */
+async function areasScenario(card) {
+    const results = [];
+    const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
+    const root = card.shadowRoot;
+    const $ = (s) => root.querySelector(s);
+    const click = (s) => $(s).click();
+    const sets = () => published.filter((p) => p.topic === `${config.topic}/set`).map((p) => JSON.parse(p.payload));
+    const message = () => $(".editor .msg")?.textContent || "";
+    const count = () => card._edit.draft.reduce((n, b) => n + b, 0);
+    const tap = (r, c) => {
+        const [X, Y] = card._T(400 - 50 * c - 25, 50 * r + 25);
+        const p = new DOMPoint(X, Y).matrixTransform(card._el.svg.getScreenCTM());
+        const ev = {clientX: p.x, clientY: p.y, bubbles: true, pointerId: 1, button: 0, isPrimary: true, pointerType: "mouse"};
+        card._el.svg.dispatchEvent(new PointerEvent("pointerdown", ev));
+        card._el.svg.dispatchEvent(new PointerEvent("pointerup", ev));
+    };
+    window.confirm = () => true;
+
+    check("The reduced view draws the lounge's three zones from the compact entity", cards[2].card.shadowRoot.querySelectorAll(".zones .zone").length === 3);
+    click('.actions [data-action="open"]');
+    check("The editor opens on zones, with the three areas as layers", card._edit.layer === "zone" && root.querySelectorAll('.editor [data-action="layer"]').length === 4);
+
+    click('[data-action="layer"][data-layer="entry"]');
+    check("Entrances open with the sensor's 5 cells", card._edit.layer === "entry" && count() === 5, `${count()}`);
+    check("The saved entrances are hidden while the draft is shown", card._el.svg.classList.contains("editing-entry"));
+    tap(1, 3);
+    click('[data-action="save"]');
+    await wait(600);
+    const entry = sets().at(-1);
+    check("Saving entrances sends entry_exit_mask_hex without the tapped cell", entry.entry_exit_mask_hex === "00000000100000100010001000000000000000000000000000000000000000000000000000000000", JSON.stringify(entry));
+    check("…and is confirmed by the sensor's mask", /Entrances saved/.test(message()) && count() === 4, message());
+
+    click('[data-action="layer"][data-layer="edge"]');
+    check("The monitored area opens as the 81 watched cells", card._edit.layer === "edge" && count() === 81, `${count()}`);
+    click('[data-action="fit"]');
+    check("Fit to room gives the same 81 cells, so there is nothing to save", count() === 81 && $('[data-action="save"]').disabled);
+    tap(1, 7);
+    click('[data-action="save"]');
+    await wait(600);
+    const edge = sets().at(-1);
+    check("Saving sends edge_mask_hex with the removed cell now ignored", edge.edge_mask_hex === "e00fe10fe00fe00fe00fe00fe00fe00fe00fffffffffffffffffffffffffffffffffffffffffffff", JSON.stringify(edge));
+    check("…and is confirmed", /Monitored area saved/.test(message()) && count() === 80, message());
+    card._edit.draft = new Uint8Array(320);
+    card._drawEditor();
+    check("An empty monitored area cannot be saved", $('[data-action="save"]').disabled && /ignore the whole room/.test($(".editor").textContent));
+    click('[data-action="revert"]');
+
+    click('[data-action="layer"][data-layer="interference"]');
+    tap(6, 6);
+    click('[data-action="save"]');
+    await wait(600);
+    check("Interference saves and is confirmed", "interference_mask_hex" in sets().at(-1) && /Interference saved/.test(message()), message());
+    click('[data-action="close"]');
+    check("Done closes the editor and shows the areas again", !card._edit && !card._el.svg.classList.contains("editing-interference"));
+
+    const leaving = structuredClone(current);
+    leaving.targets = [{id: 1, x: -120, y: 330, zone: 0, speed: 0, leaving: true}];
+    emit(config.topic, leaving);
+    await wait(100);
+    check("A target the sensor is dropping is drawn faded and listed as leaving", Boolean(root.querySelector(".targets g.leaving")) && /leaving/.test($(".rows").textContent));
+    document.getElementById("result").textContent = results.join("\n");
+    // &stay=LAYER leaves that layer open for a screenshot.
+    if (params.get("stay")) {
+        click('.actions [data-action="open"]');
+        click(`[data-action="layer"][data-layer="${params.get("stay")}"]`);
+    }
+}
+window.__done = true;
+
+/* ── A sensor that has never had a zone (use with config=study&fixtures=no-zones) ── */
+async function zonesScenario(card) {
+    await wait(500);
+    const results = [];
+    const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
+    const gets = published.filter((p) => p.topic === `${config.topic}/get` && "configured_zones" in JSON.parse(p.payload));
+    check("The fixture has no zone list", !("configured_zones" in fixtures[start].payload));
+    check("Asked for the zone list once, for both admin cards", gets.length === 1, `${gets.length} reads`);
+    check("Edit zones shown once the list is known", Boolean(card.shadowRoot.querySelector('.actions [data-action="open"]')));
+    check("No Edit zones in the reduced view", !cards[2].card.shadowRoot.querySelector('[data-action="open"]'));
+    check("The footnote names the card version", /Card \d+\.\d+\.\d+\.$/.test(card.shadowRoot.querySelector(".note").textContent));
+    card.shadowRoot.querySelector('.actions [data-action="open"]')?.click();
+    check("The editor opens on a new zone 1", card._edit?.id === 1 && card._edit.isNew);
+    document.getElementById("result").textContent = results.join("\n");
+}
+
+/* ── The editor scenario ── */
+async function editScenario(card) {
+    const results = [];
+    const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
+    const root = card.shadowRoot;
+    const $ = (s) => root.querySelector(s);
+    const click = (s) => $(s).click();
+    const sets = () => published.filter((p) => p.topic === `${config.topic}/set`).map((p) => p.payload);
+    const zoneHex = (id) => current.configured_zones.find((z) => z.zone_id === id)?.mask_hex;
+    const message = () => $(".editor .msg")?.textContent || "";
+    const point = (r, c) => {
+        const [X, Y] = card._T(400 - 50 * c - 25, 50 * r + 25);
+        const p = new DOMPoint(X, Y).matrixTransform(card._el.svg.getScreenCTM());
+        return {clientX: p.x, clientY: p.y, bubbles: true, pointerId: 1, button: 0, isPrimary: true, pointerType: "mouse"};
+    };
+    const drag = (a, b) => {
+        const svg = card._el.svg;
+        svg.dispatchEvent(new PointerEvent("pointerdown", point(...a)));
+        svg.dispatchEvent(new PointerEvent("pointermove", point(...b)));
+        svg.dispatchEvent(new PointerEvent("pointerup", point(...b)));
+    };
+    window.confirm = () => true;
+    const original = structuredClone(current.configured_zones);
+
+    check("Edit button shown to an admin in the live view", Boolean($('.actions [data-action="open"]')));
+    check("No Edit button in the reduced view", !cards[2].card.shadowRoot.querySelector('[data-action="open"]'));
+    click('.actions [data-action="open"]');
+    check("Editor opens on the first zone (Table)", card._edit?.id === 1 && $(".editor .zones-bar .btn.sel")?.textContent === "Table");
+    check("The edited zone's outline is replaced by the draft", !root.querySelector(".zones .zone text")?.textContent.startsWith("Table"));
+
+    click('[data-action="new"]');
+    check("New zone takes the lowest free id", card._edit?.id === 4 && card._edit.isNew);
+    check("Create is disabled while the draft is empty", $('[data-action="save"]').disabled);
+
+    drag([2, 9], [3, 10]);
+    const a = "00000000006000600000000000000000000000000000000000000000000000000000000000000000";
+    check("Dragging a rectangle fills its cells", card._edit.draft.reduce((n, b) => n + b, 0) === 4 && [...card._edit.draft.keys()].filter((i) => card._edit.draft[i]).join() === "41,42,57,58");
+    check("A 4th zone says the light sensor moves to once a minute", /light sensor gives up its reporting slot/.test($(".editor").textContent));
+    click('[data-action="save"]');
+    check("Saving shows progress and locks the editor", message().startsWith("Creating") && $('[data-action="close"]').disabled);
+    await wait(250);
+    check("An intermediate publish without the zone does not count as confirmed", card._edit.pending !== null);
+    await wait(400);
+    check("Create sends native_zone with the drawn cells", sets().at(-1) === JSON.stringify({native_zone: {zone_id: 4, mask_hex: a}}));
+    check("Confirmed when the sensor's list has exactly those cells", zoneHex(4) === a && !card._edit.pending && /created/.test(message()), message());
+    check("The new zone is now an existing one", card._edit.id === 4 && !card._edit.isNew);
+
+    drag([6, 9], [6, 9]); // one cell, which is Armchair's
+    check("A tap toggles one cell", card._edit.draft[6 * 16 + 9] === 1);
+    check("Overlap with Armchair is warned about", /Shares cells with Armchair/.test($(".editor").textContent));
+    drag([6, 9], [6, 9]);
+    check("Tapping it again clears it", card._edit.draft[6 * 16 + 9] === 0 && !/Shares cells/.test($(".editor").textContent));
+    drag([4, 9], [4, 10]);
+    const b = "00000000006000600060000000000000000000000000000000000000000000000000000000000000";
+    click('[data-action="save"]');
+    await wait(700);
+    check("Reshaping sends the new cells and is confirmed", zoneHex(4) === b && /saved/.test(message()), message());
+
+    const select = $('select[data-setting="sensitivity"]');
+    select.value = "high";
+    select.dispatchEvent(new Event("change", {bubbles: true}));
+    await wait(400);
+    check("Sensitivity is written and confirmed", sets().at(-1) === JSON.stringify({zone_4_sensitivity: "high"}) && /sensitivity high/.test(message()), message());
+    const timeout = $('input[data-setting="absence_timeout"]');
+    timeout.value = "45";
+    timeout.dispatchEvent(new Event("change", {bubbles: true}));
+    await wait(400);
+    check("Absence timeout is written and confirmed", sets().at(-1) === JSON.stringify({zone_4_absence_timeout: 45}) && /45 s/.test(message()), message());
+
+    window.__failNext = "The sensor answered updateZone with status 0x87";
+    drag([2, 9], [2, 9]);
+    click('[data-action="save"]');
+    await wait(400);
+    check("A Zigbee2MQTT error is shown at once", /Not applied: The sensor answered updateZone with status 0x87/.test(message()) && !card._edit.pending, message());
+    check("After an error the draft is kept for another try", card._edit.draft[2 * 16 + 9] === 0 && !$('[data-action="save"]').disabled);
+    click('[data-action="revert"]');
+
+    click('[data-action="delete"]');
+    await wait(400);
+    check("Delete sends native_zone_remove and is confirmed", sets().at(-1) === JSON.stringify({native_zone_remove: 4}) && !zoneHex(4) && /removed/.test(message()), message());
+    check("Zones 1-3 are untouched", JSON.stringify(current.configured_zones) === JSON.stringify(original));
+
+    // Leave a draft on screen for the screenshot: a new zone by the window, sharing a cell with Armchair.
+    click('[data-action="new"]');
+    drag([7, 7], [8, 8]);
+    drag([7, 9], [7, 9]);
+    check("Draft with overlap warning on screen", /Shares cells with Armchair/.test($(".editor").textContent));
+    document.getElementById("result").textContent = results.join("\n");
+}
+
+/* ── 0.4.0: software zones, settings, dots, zoom (lounge) ── */
+function kit(card) {
+    const results = [];
+    const root = card.shadowRoot;
+    const $ = (s) => root.querySelector(s);
+    const t = {
+        root,
+        $,
+        check: (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`),
+        click: (s) => $(s).click(),
+        sets: () => published.filter((p) => p.topic === `${config.topic}/set`).map((p) => JSON.parse(p.payload)),
+        msg: (s = ".editor .msg") => $(s)?.textContent || "",
+        // A point of the sensor frame (cm), on screen.
+        at: (x, y, c = card) => {
+            const [X, Y] = c._T(x, y);
+            return new DOMPoint(X, Y).matrixTransform(c._el.svg.getScreenCTM());
+        },
+        pointer: (type, p, c = card) =>
+            c._el.svg.dispatchEvent(new PointerEvent(type, {clientX: p.x, clientY: p.y, bubbles: true, pointerId: 1, button: 0, isPrimary: true, pointerType: "mouse"})),
+        report: () => {
+            document.getElementById("result").textContent = results.join("\n");
+        },
+    };
+    t.tap = (p, c = card) => {
+        t.pointer("pointerdown", p, c);
+        t.pointer("pointerup", p, c);
+    };
+    t.drag = (a, b) => {
+        t.pointer("pointerdown", a);
+        t.pointer("pointermove", {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2});
+        t.pointer("pointermove", b);
+        t.pointer("pointerup", b);
+    };
+    t.input = (sel, value, type = "input") => {
+        const n = $(sel);
+        n.focus();
+        n.value = value;
+        n.dispatchEvent(new Event(type, {bubbles: true}));
+    };
+    t.dot = (id, c = card) => {
+        const d = c._dotAt.get(id);
+        return d && new DOMPoint(d.X, d.Y).matrixTransform(c._el.svg.getScreenCTM());
+    };
+    window.confirm = () => true;
+    return t;
+}
+
+async function softwareScenario(card) {
+    const t = kit(card);
+    const {check, $, click} = t;
+    await wait(200);
+    click('.actions [data-action="open"]');
+    check("Software zones is an editor layer when the device publishes them", Boolean($('[data-action="layer"][data-layer="software"]')) && t.root.querySelectorAll('.editor [data-action="layer"]').length === 5);
+    click('[data-action="layer"][data-layer="software"]');
+    check("Without zones it opens a new zone 1, nothing to save yet", card._edit.layer === "software" && card._edit.id === 1 && card._edit.isNew && $('[data-action="save"]').disabled);
+    t.drag(t.at(-17, 122), t.at(83, 228));
+    check("Dragging draws a rectangle in 10 cm steps", JSON.stringify(card._edit.sz) === JSON.stringify({x_min: -20, x_max: 80, y_min: 120, y_max: 230}), JSON.stringify(card._edit.sz));
+    check("The draft is drawn on the map", card._el.edit.querySelectorAll(".drafto").length === 1);
+    t.input('input[data-sz="name"]', "Desk");
+    check("Typing the name keeps the field focused", t.root.activeElement?.dataset.focus === "sz-name" && card._edit.name === "Desk" && /Desk \(new\)/.test($(".zones-bar").textContent));
+    t.input('input[data-sz="timeout"]', "500");
+    check("An absence timeout over 300 s cannot be saved", $('[data-action="save"]').disabled && /0 to 300/.test($(".editor").textContent));
+    t.input('input[data-sz="timeout"]', "5");
+    click('[data-action="save"]');
+    check("Saving shows progress and locks the editor", /Creating Desk/.test(t.msg()) && $('[data-action="close"]').disabled, t.msg());
+    await wait(400);
+    const desk = {name: "Desk", x_min: -20, x_max: 80, y_min: 120, y_max: 230, absence_timeout: 5};
+    check("Create sends software_zone_1_config as a JSON string", t.sets().at(-1).software_zone_1_config === JSON.stringify(desk), JSON.stringify(t.sets().at(-1)));
+    check("…confirmed when the published zone is the one sent", /Desk created/.test(t.msg()) && !card._edit.isNew && card._edit.id === 1, t.msg());
+
+    click('[data-action="soft-new"]');
+    check("+ New takes the lowest free slot", card._edit.id === 2 && card._edit.isNew);
+    t.drag(t.at(-140, 260), t.at(-60, 370));
+    t.input('input[data-sz="name"]', "Nook");
+    click('[data-action="save"]');
+    await wait(400);
+    check("A second zone is created", JSON.parse(sticky.software_zone_2_config).name === "Nook" && /Nook created/.test(t.msg()), t.msg());
+    window.__failNext = "A software zone's name must be 1 to 32 characters";
+    t.input('input[data-sz="name"]', "Reading nook");
+    click('[data-action="save"]');
+    await wait(400);
+    check("A Zigbee2MQTT error is shown and the draft kept", /Not applied: A software zone's name/.test(t.msg()) && card._edit.name === "Reading nook" && !$('[data-action="save"]').disabled, t.msg());
+    click('[data-action="save"]');
+    await wait(400);
+    check("Saving again renames it", JSON.parse(sticky.software_zone_2_config).name === "Reading nook" && /Reading nook saved/.test(t.msg()), t.msg());
+    click('[data-action="delete"]');
+    await wait(400);
+    check("Delete sends clear and is confirmed", t.sets().at(-1).software_zone_2_config === "clear" && sticky.software_zone_2_config === "clear" && /removed/.test(t.msg()) && card._edit.id === 1, t.msg());
+    click('[data-action="close"]');
+
+    const drawn = t.root.querySelectorAll(".soft .sz");
+    check("The zone is drawn on the map, filled while someone is in it", drawn.length === 1 && drawn[0].classList.contains("occ") && /Desk · 1/.test(drawn[0].textContent), drawn[0]?.textContent);
+    check("…and listed with its count and activity", /Software zones● Desk · 1 · moving/.test($(".rows").textContent), $(".rows").textContent);
+    check("…and in the legend", /software zone/.test($(".legend").textContent));
+    sticky.software_zone_3_config = JSON.stringify({name: "Walkway", x_min: -60, x_max: 40, y_min: 200, y_max: 380, absence_timeout: 3, rotation: 20});
+    emitState();
+    await wait(50);
+    const walkway = [...t.root.querySelectorAll(".soft .sz")].find((g) => /Walkway/.test(g.textContent));
+    const pts = (walkway?.querySelector("polygon.so")?.getAttribute("points") || "").split(" ").map((p) => p.split(",").map(Number));
+    const expected = [[-60, 200], [40, 200], [40, 380], [-60, 380]].map(([x, y]) => {
+        const a = (20 * Math.PI) / 180;
+        return card._T(x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a));
+    });
+    check("A turned zone is drawn turned", pts.length === 4 && pts.every((p, i) => Math.hypot(p[0] - expected[i][0], p[1] - expected[i][1]) < 0.2), JSON.stringify(pts));
+    for (const c of cards) if (!c.admin) c.card.hass = {...c.hass, states: statesFrom(fullState())};
+    await wait(50);
+    check("The reduced view draws them from their entities", cards[2].card.shadowRoot.querySelectorAll(".soft .sz").length === 2 && /Desk/.test(cards[2].card.shadowRoot.querySelector(".rows").textContent));
+    t.report();
+    if (params.get("stay") === "software") {
+        click('.actions [data-action="open"]');
+        click('[data-action="layer"][data-layer="software"]');
+        click('[data-action="soft-new"]');
+        t.drag(t.at(-140, 380), t.at(-60, 480));
+        t.input('input[data-sz="name"]', "Plant");
+        $('input[data-sz="name"]').blur();
+    }
+}
+
+async function settingsScenario(card) {
+    const t = kit(card);
+    const {check, $, click} = t;
+    await wait(200);
+    check("Settings sits next to Edit zones and areas", Boolean($('.actions [data-action="settings"]')) && Boolean($('.actions [data-action="open"]')));
+    check("No Settings in the reduced view", !cards[2].card.shadowRoot.querySelector('[data-action="settings"]'));
+    click('.actions [data-action="settings"]');
+    const controls = [...t.root.querySelectorAll(".editor [data-config]")].map((n) => n.dataset.config);
+    check("One control per setting the device publishes (14)", controls.length === 14, controls.join());
+    check("The panel takes the buttons' place", !$('.actions [data-action="open"]'));
+    const choose = (key, value) => {
+        const n = $(`[data-config="${key}"]`);
+        n.value = value;
+        n.dispatchEvent(new Event("change", {bubbles: true}));
+    };
+    choose("presence_sensitivity", "low");
+    check("A write locks the panel until it is confirmed", $('[data-config="ai_high_precision"]').disabled && /Setting sensitivity to low/.test(t.msg()), t.msg());
+    await wait(400);
+    check("Sensitivity is written and confirmed", JSON.stringify(t.sets().at(-1)) === '{"presence_sensitivity":"low"}' && /Sensitivity: low/.test(t.msg()), t.msg());
+    const box = $('[data-config="ai_high_precision"]');
+    box.checked = true;
+    box.dispatchEvent(new Event("change", {bubbles: true}));
+    await wait(400);
+    check("A switch writes ON", JSON.stringify(t.sets().at(-1)) === '{"ai_high_precision":"ON"}' && /High precision: on/.test(t.msg()) && $('[data-config="ai_high_precision"]').checked, t.msg());
+    const n = t.sets().length;
+    t.input('[data-config="absence_timeout"]', "400", "change");
+    check("A number out of range is refused without writing", t.sets().length === n && /0 to 300/.test(t.msg()), t.msg());
+    t.input('[data-config="absence_timeout"]', "30", "change");
+    await wait(400);
+    check("The absence timeout is written and confirmed", JSON.stringify(t.sets().at(-1)) === '{"absence_timeout":30}' && /Empty after: 30 s/.test(t.msg()), t.msg());
+    check("The panel has no map rotation: only the card's own rotation option turns the map", !$('[data-config="map_rotation"]') && card._rotation === 0);
+    t.input('[data-config="forget_still_targets"]', "30", "change");
+    await wait(400);
+    check("forget_still_targets is written and confirmed", sticky.forget_still_targets === 30 && /Forget still dots after: 30 min/.test(t.msg()), t.msg());
+    window.__failNext = "proximity_distance is not supported";
+    const prox = current.proximity_distance;
+    choose("proximity_distance", prox === "far" ? "near" : "far");
+    await wait(400);
+    check("A Zigbee2MQTT error is shown and the control goes back to the device's value", /Not applied: proximity_distance is not supported/.test(t.msg()) && $('[data-config="proximity_distance"]').value === prox, t.msg());
+    click('[data-action="learn"]');
+    await wait(400);
+    check("Learn the empty room sends spatial_learning start and is confirmed", JSON.stringify(t.sets().at(-1)) === '{"spatial_learning":"start"}' && /started learning/.test(t.msg()), t.msg());
+    await wait(900);
+    check("…and shows the result when it comes", /Finished, result code 0/.test($(".editor").textContent));
+    check("Restore status is shown, read-only", /RestoreStatusok/.test($(".editor").textContent.replace(/\s+/g, "")) && !$('[data-config="restore_status"]'));
+    click('[data-action="close-settings"]');
+    check("Done closes the panel", !$(".editor .panel") && Boolean($('.actions [data-action="settings"]')));
+    t.report();
+    if (params.get("stay") === "settings") click('.actions [data-action="settings"]');
+}
+
+async function dotScenario(card) {
+    const t = kit(card);
+    const {check, $, click} = t;
+    await wait(200);
+    const target = current.targets[0];
+    const pop = card._el.pop;
+    t.tap(t.dot(target.id));
+    check("Clicking a dot opens its popover", !pop.hidden && new RegExp(`Target ${target.id}`).test(pop.textContent), pop.textContent);
+    const pr = pop.getBoundingClientRect();
+    const mr = card._el.map.getBoundingClientRect();
+    check("…inside the map", pr.left >= mr.left && pr.right <= mr.right && pr.top >= mr.top && pr.bottom <= mr.bottom, `${pr.left},${pr.top},${pr.right},${pr.bottom} in ${mr.left},${mr.top},${mr.right},${mr.bottom}`);
+    t.tap(t.at(-150, 60));
+    check("Clicking elsewhere on the map closes it", pop.hidden);
+    const reduced = cards[2].card;
+    t.tap(t.dot(target.id, reduced), reduced);
+    check("No popover in the reduced view", reduced._el.pop.hidden);
+
+    t.tap(t.dot(target.id));
+    const n = t.sets().length;
+    click('.pop [data-action="ignore"]');
+    const around = cellsAround(target.x, target.y);
+    check("Ignore this spot opens the interference layer with the 2 x 2 cells around the dot", card._edit?.layer === "interference" && around.every((i) => card._edit.draft[i]) && pop.hidden, around.join());
+    check("…and writes nothing before Save", t.sets().length === n && new RegExp(`target ${target.id}`).test(t.msg()), t.msg());
+    click('[data-action="save"]');
+    await wait(600);
+    const hex = t.sets().at(-1).interference_mask_hex || "";
+    const bits = hex.match(/../g)?.flatMap((b) => [...Number.parseInt(b, 16).toString(2).padStart(8, "0")].map(Number)) || [];
+    check("…saved as interference cells and confirmed", around.every((i) => bits[i] === 1) && /Interference saved/.test(t.msg()), t.msg());
+    t.tap(t.dot(target.id));
+    check("While editing, a click on a dot draws instead of opening the popover", pop.hidden);
+    click('[data-action="close"]');
+
+    t.tap(t.dot(target.id));
+    click('.pop [data-action="forget"]');
+    check("Forget locks the popover while it waits", $('.pop [data-action="forget"]').disabled && /Asking the sensor to forget/.test(t.msg(".pop .msg")));
+    await wait(400);
+    check("Forget sends remove_target with the dot's id", JSON.stringify(t.sets().at(-1)) === JSON.stringify({remove_target: target.id}));
+    check("…confirmed when the sensor stops reporting it", new RegExp(`Target ${target.id} forgotten`).test(t.msg(".pop .msg")) && !card._snap.targets.some((x) => x.id === target.id) && /No longer reported/.test(pop.textContent), t.msg(".pop .msg"));
+    t.tap(t.at(-150, 60));
+    current = {...current, targets: [{id: 2, x: -60, y: 300, zone: 0, speed: 0}, {id: 3, x: 80, y: 420, zone: 0, speed: 12}], target_count: 2};
+    emitState();
+    await wait(50);
+    window.__failNext = "The sensor did not accept removing target 2 (status 135)";
+    t.tap(t.dot(2));
+    click('.pop [data-action="forget"]');
+    await wait(400);
+    check("An error is shown in the popover", /Not applied: The sensor did not accept removing target 2/.test(t.msg(".pop .msg")) && !$('.pop [data-action="forget"]').disabled, t.msg(".pop .msg"));
+    document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape"}));
+    check("Escape closes it", pop.hidden);
+    t.report();
+    if (params.get("stay") === "pop") t.tap(t.dot(3));
+}
+
+async function viewScenario(card) {
+    const t = kit(card);
+    const {check} = t;
+    await wait(200);
+    const svg = card._el.svg;
+    const vb = () => svg.getAttribute("viewBox").split(" ").map(Number);
+    const fit = vb();
+    const fs0 = card._fs;
+    const r = svg.getBoundingClientRect();
+    const centre = {x: r.left + r.width / 2, y: r.top + r.height / 2};
+    const under = (p) => card._clientToUser(p.x, p.y);
+    const p0 = under({x: centre.x + 40, y: centre.y + 30});
+    const plain = new WheelEvent("wheel", {deltaY: -400, clientX: centre.x, clientY: centre.y, bubbles: true, cancelable: true});
+    svg.dispatchEvent(plain);
+    check("A plain wheel over the whole map scrolls the page", card._zoom() === 1 && !plain.defaultPrevented);
+    svg.dispatchEvent(new WheelEvent("wheel", {deltaY: -400, metaKey: true, clientX: centre.x + 40, clientY: centre.y + 30, bubbles: true, cancelable: true}));
+    const k = card._zoom();
+    const p1 = under({x: centre.x + 40, y: centre.y + 30});
+    check("⌘ and the wheel zoom in about the pointer", k > 1.5 && Math.abs(vb()[2] - fit[2] / k) < 0.2 && Math.hypot(p1.x - p0.x, p1.y - p0.y) < 0.5, `${k.toFixed(2)}x, moved ${Math.hypot(p1.x - p0.x, p1.y - p0.y).toFixed(2)}`);
+    check("Labels and dots keep their size on screen", Math.abs(card._fs * k - fs0) < 1e-6);
+    check("A Fit button shows while zoomed in", Boolean(t.$('.zoomctl [data-action="fit-view"]')));
+    const before = vb();
+    t.drag(centre, {x: centre.x + 60, y: centre.y + 30});
+    check("Dragging pans", vb()[0] < before[0] && vb()[1] < before[1], `${before.join()} → ${vb().join()}`);
+    check("A drag opens no popover", card._el.pop.hidden);
+    t.click('.zoomctl [data-action="fit-view"]');
+    check("Fit shows the whole map again", vb().join() === fit.join() && !t.$(".zoomctl .btn"));
+    const touch = (type, id, x) => svg.dispatchEvent(new PointerEvent(type, {clientX: x, clientY: centre.y, bubbles: true, pointerId: id, isPrimary: id === 11, pointerType: "touch", button: 0}));
+    touch("pointerdown", 11, centre.x - 20);
+    touch("pointerdown", 12, centre.x + 20);
+    touch("pointermove", 11, centre.x - 60);
+    touch("pointermove", 12, centre.x + 60);
+    touch("pointerup", 11, centre.x - 60);
+    touch("pointerup", 12, centre.x + 60);
+    check("A pinch zooms (fingers 3x further apart: 3x)", Math.abs(card._zoom() - 3) < 0.01, `${card._zoom()}`);
+    svg.dispatchEvent(new MouseEvent("dblclick", {bubbles: true}));
+    check("A double-click shows the whole map again", card._zoom() === 1 && vb().join() === fit.join());
+    for (let i = 0; i < 30; i++) svg.dispatchEvent(new WheelEvent("wheel", {deltaY: -400, ctrlKey: i === 0, clientX: centre.x, clientY: centre.y, bubbles: true, cancelable: true}));
+    check("Zoom stops at 8x", card._zoom() === 8);
+    svg.dispatchEvent(new MouseEvent("dblclick", {bubbles: true}));
+
+    current = {...current, installation_mode: "ceiling"};
+    emitState();
+    await wait(50);
+    check("A ceiling sensor without a room outline is framed 6 m all around", vb().join() === "-625,-625,1250,1250", vb().join());
+    current = {...current, installation_mode: "wall"};
+    emitState();
+    await wait(50);
+    check("Back on the wall, the monitored area frames it again", vb().join() === fit.join(), vb().join());
+    sticky.map_rotation = 90; // as an older converter left it in the device's state
+    emitState();
+    for (const c of cards) if (!c.admin) c.card.hass = {...c.hass, states: statesFrom(fullState())};
+    await wait(50);
+    check("A map_rotation left in the device's state turns no map", cards.every((c) => c.card._rotation === 0) && vb().join() === fit.join(), vb().join());
+    delete sticky.map_rotation;
+    t.report();
+    if (params.get("stay") === "zoom") {
+        svg.dispatchEvent(new WheelEvent("wheel", {deltaY: -300, metaKey: true, clientX: centre.x, clientY: centre.y, bubbles: true, cancelable: true}));
+    }
+    if (params.get("stay") === "ceiling") {
+        current = {...current, installation_mode: "ceiling", targets: [...current.targets, {id: 4, x: 120, y: -240, zone: 0, speed: 0}]};
+        emitState();
+    }
+}
+</script>
+</body>
+</html>

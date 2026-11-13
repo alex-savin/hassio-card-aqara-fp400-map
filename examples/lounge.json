@@ -1,0 +1,191 @@
+{
+  "type": "custom:fp400-map-card",
+  "title": "Lounge",
+  "topic": "zigbee2mqtt/fp400_lounge",
+  "entity_prefix": "fp400_lounge",
+  "rotation": 180,
+  "zones": {
+    "1": "Table",
+    "2": "Sofa",
+    "3": "Armchair"
+  },
+  "room": {
+    "outline_mm": [
+      [
+        -1950,
+        -100
+      ],
+      [
+        2450,
+        -100
+      ],
+      [
+        2450,
+        4420
+      ],
+      [
+        -1950,
+        4420
+      ]
+    ],
+    "features": [
+      {
+        "type": "door",
+        "name": "Entrance",
+        "points_mm": [
+          [
+            2450,
+            600
+          ],
+          [
+            2450,
+            1500
+          ]
+        ]
+      },
+      {
+        "type": "opening",
+        "name": "Hall",
+        "points_mm": [
+          [
+            -1950,
+            1600
+          ],
+          [
+            -1950,
+            2900
+          ]
+        ]
+      },
+      {
+        "type": "window",
+        "name": "Window",
+        "points_mm": [
+          [
+            -900,
+            4420
+          ],
+          [
+            1100,
+            4420
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Table",
+        "points_mm": [
+          [
+            800,
+            1300
+          ],
+          [
+            1700,
+            1300
+          ],
+          [
+            1700,
+            2200
+          ],
+          [
+            800,
+            2200
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Sofa",
+        "points_mm": [
+          [
+            1500,
+            3300
+          ],
+          [
+            2400,
+            3300
+          ],
+          [
+            2400,
+            4300
+          ],
+          [
+            1500,
+            4300
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Armchair",
+        "points_mm": [
+          [
+            -1800,
+            3400
+          ],
+          [
+            -1000,
+            3400
+          ],
+          [
+            -1000,
+            4200
+          ],
+          [
+            -1800,
+            4200
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Bookcase",
+        "points_mm": [
+          [
+            -1950,
+            3000
+          ],
+          [
+            -1650,
+            3000
+          ],
+          [
+            -1650,
+            3300
+          ],
+          [
+            -1950,
+            3300
+          ]
+        ],
+        "label": false
+      },
+      {
+        "type": "fixture",
+        "name": "Fan",
+        "points_mm": [
+          [
+            -1900,
+            600
+          ],
+          [
+            -1600,
+            600
+          ],
+          [
+            -1600,
+            900
+          ],
+          [
+            -1900,
+            900
+          ]
+        ]
+      }
+    ]
+  },
+  "grid_options": {
+    "columns": 12,
+    "rows": "auto"
+  }
+}

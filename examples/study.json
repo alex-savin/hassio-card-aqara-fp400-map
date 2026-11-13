@@ -1,0 +1,127 @@
+{
+  "type": "custom:fp400-map-card",
+  "title": "Study",
+  "topic": "zigbee2mqtt/fp400_study",
+  "entity_prefix": "fp400_study",
+  "rotation": -45,
+  "room": {
+    "outline_mm": [
+      [
+        0,
+        -100
+      ],
+      [
+        3182,
+        3082
+      ],
+      [
+        495,
+        5769
+      ],
+      [
+        -2687,
+        2587
+      ]
+    ],
+    "features": [
+      {
+        "type": "door",
+        "name": "Door",
+        "points_mm": [
+          [
+            1344,
+            4920
+          ],
+          [
+            707,
+            5557
+          ]
+        ]
+      },
+      {
+        "type": "window",
+        "name": "Window",
+        "points_mm": [
+          [
+            -1838,
+            3436
+          ],
+          [
+            -424,
+            4850
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Desk",
+        "points_mm": [
+          [
+            -1838,
+            2163
+          ],
+          [
+            -707,
+            3294
+          ],
+          [
+            -1273,
+            3860
+          ],
+          [
+            -2404,
+            2728
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Chair",
+        "points_mm": [
+          [
+            -1061,
+            2092
+          ],
+          [
+            -636,
+            2516
+          ],
+          [
+            -990,
+            2870
+          ],
+          [
+            -1414,
+            2446
+          ]
+        ]
+      },
+      {
+        "type": "furniture",
+        "name": "Bookcase",
+        "points_mm": [
+          [
+            2192,
+            2233
+          ],
+          [
+            3041,
+            3082
+          ],
+          [
+            2793,
+            3329
+          ],
+          [
+            1945,
+            2481
+          ]
+        ]
+      }
+    ]
+  },
+  "grid_options": {
+    "columns": 12,
+    "rows": "auto"
+  }
+}
