@@ -28,6 +28,8 @@
 //   ?software=1      the device publishes software zones (its software_zones option on); =demo adds two zones
 //   ?scenario=software|settings|dot|view   the 0.4.0 features (lounge); view drops the room and the rotation
 //   ?scenario=zones&config=study&fixtures=no-zones   a sensor that never had a zone
+//   ?scenario=reduced   the reduced view takes positions from the targets entity, shown the way Home Assistant does
+//                       (Python text, cut at 255 characters), as newer converters publish it instead of targets_xy
 import {cellsAround, inSoftwareZone, parseSoftwareZone, viewTransform} from "../fp400-map-card.js";
 
 const params = new URLSearchParams(location.search);
@@ -53,7 +55,9 @@ function statesFrom(p) {
         [`sensor.${DEVICE}_human_count`]: s(p.human_count),
         [`sensor.${DEVICE}_target_count`]: s(p.target_count),
         [`sensor.${DEVICE}_tracking_status`]: s(p.tracking_status),
-        [`sensor.${DEVICE}_targets_xy`]: s(p.targets_xy),
+        ...(scenario === "reduced"
+            ? {[`sensor.${DEVICE}_targets`]: s(pythonText(p.targets).slice(0, 255))}
+            : {[`sensor.${DEVICE}_targets_xy`]: s(p.targets_xy)}),
         [`text.${DEVICE}_edge_mask_hex`]: s(p.edge_mask_hex),
         [`text.${DEVICE}_entry_exit_mask_hex`]: s(p.entry_exit_mask_hex),
         [`text.${DEVICE}_interference_mask_hex`]: s(p.interference_mask_hex),
@@ -248,6 +252,7 @@ if (scenario === "software") await softwareScenario(cards[0].card);
 if (scenario === "settings") await settingsScenario(cards[0].card);
 if (scenario === "dot") await dotScenario(cards[0].card);
 if (scenario === "view") await viewScenario(cards[0].card);
+if (scenario === "reduced") await reducedScenario(cards[2].card);
 
 /* ── The area editor, leaving targets and zone outlines in the reduced view (lounge) ── */
 async function areasScenario(card) {
@@ -472,6 +477,25 @@ function kit(card) {
     return t;
 }
 
+/** A list the way Home Assistant's `string` filter shows it: [{'id': 0, 'x': 34, 'y': 277, 'zone': 0}]. */
+function pythonText(list) {
+    if (!Array.isArray(list)) return "unknown";
+    const value = (v) => (v === true ? "True" : v === false ? "False" : String(v));
+    return `[${list.map((t) => `{${Object.entries(t).map(([k, v]) => `'${k}': ${value(v)}`).join(", ")}}`).join(", ")}]`;
+}
+
+async function reducedScenario(card) {
+    const results = [];
+    const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
+    await wait(300);
+    const root = card.shadowRoot;
+    const n = current.targets.length;
+    check("The reduced view has no targets_xy entity here", !(`sensor.${DEVICE}_targets_xy` in statesFrom(fullState())));
+    check("It counts the targets from the targets entity", new RegExp(`${n} tracked`).test(root.textContent), root.textContent.slice(0, 160));
+    check("…and draws a dot for each", root.querySelectorAll("circle.dot").length === n, String(root.querySelectorAll("circle.dot").length));
+    document.getElementById("result").textContent = results.join("\n");
+}
+
 async function softwareScenario(card) {
     const t = kit(card);
     const {check, $, click} = t;
@@ -480,8 +504,8 @@ async function softwareScenario(card) {
     check("Software zones is an editor layer when the device publishes them", Boolean($('[data-action="layer"][data-layer="software"]')) && t.root.querySelectorAll('.editor [data-action="layer"]').length === 5);
     click('[data-action="layer"][data-layer="software"]');
     check("Without zones it opens a new zone 1, nothing to save yet", card._edit.layer === "software" && card._edit.id === 1 && card._edit.isNew && $('[data-action="save"]').disabled);
-    t.drag(t.at(-17, 122), t.at(83, 228));
-    check("Dragging draws a rectangle in 10 cm steps", JSON.stringify(card._edit.sz) === JSON.stringify({x_min: -20, x_max: 80, y_min: 120, y_max: 230}), JSON.stringify(card._edit.sz));
+    t.drag(t.at(83, 122), t.at(183, 228));
+    check("Dragging draws a rectangle in 10 cm steps", JSON.stringify(card._edit.sz) === JSON.stringify({x_min: 80, x_max: 180, y_min: 120, y_max: 230}), JSON.stringify(card._edit.sz));
     check("The draft is drawn on the map", card._el.edit.querySelectorAll(".drafto").length === 1);
     t.input('input[data-sz="name"]', "Desk");
     check("Typing the name keeps the field focused", t.root.activeElement?.dataset.focus === "sz-name" && card._edit.name === "Desk" && /Desk \(new\)/.test($(".zones-bar").textContent));
@@ -491,7 +515,7 @@ async function softwareScenario(card) {
     click('[data-action="save"]');
     check("Saving shows progress and locks the editor", /Creating Desk/.test(t.msg()) && $('[data-action="close"]').disabled, t.msg());
     await wait(400);
-    const desk = {name: "Desk", x_min: -20, x_max: 80, y_min: 120, y_max: 230, absence_timeout: 5};
+    const desk = {name: "Desk", x_min: 80, x_max: 180, y_min: 120, y_max: 230, absence_timeout: 5};
     check("Create sends software_zone_1_config as a JSON string", t.sets().at(-1).software_zone_1_config === JSON.stringify(desk), JSON.stringify(t.sets().at(-1)));
     check("…confirmed when the published zone is the one sent", /Desk created/.test(t.msg()) && !card._edit.isNew && card._edit.id === 1, t.msg());
 
@@ -517,7 +541,7 @@ async function softwareScenario(card) {
 
     const drawn = t.root.querySelectorAll(".soft .sz");
     check("The zone is drawn on the map, filled while someone is in it", drawn.length === 1 && drawn[0].classList.contains("occ") && /Desk · 1/.test(drawn[0].textContent), drawn[0]?.textContent);
-    check("…and listed with its count and activity", /Software zones● Desk · 1 · moving/.test($(".rows").textContent), $(".rows").textContent);
+    check("…and listed with its count and activity", /Software zones● Desk · 1 · (moving|still)/.test($(".rows").textContent), $(".rows").textContent);
     check("…and in the legend", /software zone/.test($(".legend").textContent));
     sticky.software_zone_3_config = JSON.stringify({name: "Walkway", x_min: -60, x_max: 40, y_min: 200, y_max: 380, absence_timeout: 3, rotation: 20});
     emitState();

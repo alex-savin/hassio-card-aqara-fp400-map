@@ -6,11 +6,11 @@
  * Data sources
  * - Admin users: the card listens to the device's Zigbee2MQTT topic through Home Assistant's websocket
  *   (`mqtt/subscribe`, admin-only in Home Assistant). Every message is the device's full state, so the card
- *   gets every target (id, x, y, zone, speed), the masks and the zones. Positions reach the browser only:
- *   they are never Home Assistant states, so they never reach the recorder.
+ *   gets every target (id, x, y, zone), the masks and the zones. Positions reach the browser only: they are
+ *   never Home Assistant states, so they never reach the recorder.
  * - Everyone else (or when `topic` is not set, or the subscription fails): the reduced view, read from the
- *   device's Home Assistant entities: `targets_xy` (id, x, y), the three mask text entities, presence, counts
- *   and zone occupancy. Zone outlines and speed are not available there.
+ *   device's Home Assistant entities: `targets` (or `targets_xy` from older converters), the three mask text
+ *   entities, presence, counts and zone occupancy. Zone outlines are not available there.
  *
  * Frame: the sensor's own, in cm — x across (column 0 of the grid is x = +350..+400), y = distance out from the
  * sensor. `room.outline_mm` / `room.features` are in the same frame, in mm.
@@ -23,7 +23,7 @@
  * This file shares no code or state with any other card.
  */
 
-export const VERSION = "0.4.1";
+export const VERSION = "0.5.0";
 const TAG = "fp400-map-card";
 
 /* ── The sensor's grid ─────────────────────────────────────────────────────────────────────────────────────
@@ -367,6 +367,30 @@ export function parseTargetsXy(state) {
     return out;
 }
 
+/**
+ * Targets from the `targets` entity. Home Assistant shows the list as Python text (`[{'id': 0, 'x': 34, ...}]`) cut at
+ * 255 characters, so each complete `{...}` is read and one cut off at the end is left out. Null when unknown.
+ */
+export function parseTargetsText(state) {
+    if (state == null) return null;
+    const s = String(state).trim();
+    if (!s.startsWith("[")) return null;
+    const list = [];
+    for (const [, body] of s.matchAll(/\{([^{}]*)\}/g)) {
+        const target = {};
+        for (const [, key, value] of body.matchAll(/['"]?(\w+)['"]?\s*:\s*(-?\d+(?:\.\d+)?|True|False|true|false)/g)) {
+            target[key] = /^(True|true)$/.test(value) ? true : /^(False|false)$/.test(value) ? false : Number(value);
+        }
+        list.push(target);
+    }
+    return parseTargets(list);
+}
+
+/** Whether the `targets` entity's text was cut short, so that targets may be missing. */
+export function targetsTextCut(state) {
+    return typeof state === "string" && state.trim().startsWith("[") && !state.trim().endsWith("]");
+}
+
 /** Zones from the payload's `configured_zones`. */
 export function parseZones(list) {
     if (!Array.isArray(list)) return null;
@@ -426,6 +450,7 @@ export function entityIds(prefix, overrides = {}) {
         human_count: `sensor.${p}_human_count`,
         target_count: `sensor.${p}_target_count`,
         tracking_status: `sensor.${p}_tracking_status`,
+        targets: `sensor.${p}_targets`,
         targets_xy: `sensor.${p}_targets_xy`,
         zones_compact: `sensor.${p}_configured_zones_compact`,
         edge_mask: `text.${p}_edge_mask_hex`,
@@ -463,7 +488,12 @@ export function snapshotFromStates(states, ids) {
         if (occupied === null) continue;
         zoneState[n] = {occupied, count: num(ids.zone_count(n))};
     }
-    const targetsEntity = states[ids.targets_xy];
+    // The targets list (cut at 255 characters), or targets_xy from older converters.
+    const listEntity = states[ids.targets];
+    const listTargets = listEntity ? parseTargetsText(listEntity.state) : null;
+    const xyEntity = states[ids.targets_xy];
+    const targets = listTargets ?? (xyEntity ? parseTargetsXy(xyEntity.state) : null);
+    const cut = listTargets !== null && targetsTextCut(listEntity.state);
     // Software zones whose configuration entity exists (the device's software_zones option is on).
     const softwareZones = [];
     for (let n = 1; n <= SOFTWARE_ZONES; n++) {
@@ -486,8 +516,8 @@ export function snapshotFromStates(states, ids) {
         presence: onOff(ids.presence),
         humanCount: num(ids.human_count),
         targetCount: num(ids.target_count),
-        tracking: value(ids.tracking_status),
-        targets: targetsEntity ? parseTargetsXy(targetsEntity.state) : null,
+        tracking: cut ? "partial" : value(ids.tracking_status),
+        targets,
         masks: {edge: value(ids.edge_mask), entry: value(ids.entry_exit_mask), interference: value(ids.interference_mask)},
         // The zone list entity is cut at 255 characters; configured_zones_compact fits (newer converters publish it).
         zones: parseZonesCompact(states[ids.zones_compact]?.state),
@@ -789,7 +819,7 @@ export class Fp400MapCard extends Base {
     _entityRefs() {
         if (!this._hass || !this._ids) return [];
         const ids = this._ids;
-        const list = [ids.presence, ids.human_count, ids.target_count, ids.tracking_status, ids.targets_xy, ids.edge_mask, ids.entry_exit_mask, ids.interference_mask, ids.zones_compact, ids.installation_mode];
+        const list = [ids.presence, ids.human_count, ids.target_count, ids.tracking_status, ids.targets, ids.targets_xy, ids.edge_mask, ids.entry_exit_mask, ids.interference_mask, ids.zones_compact, ids.installation_mode];
         for (let n = 1; n <= 8; n++) list.push(ids.zone_occupancy(n), ids.zone_count(n));
         for (let n = 1; n <= SOFTWARE_ZONES; n++) list.push(ids.software_config(n), ids.software_occupancy(n), ids.software_count(n), ids.software_activity(n));
         return list.map((id) => this._hass.states[id]);
@@ -880,10 +910,16 @@ export class Fp400MapCard extends Base {
         return snapshotFromStates(this._hass.states, this._ids);
     }
 
+    /** The Home Assistant entity the reduced view takes positions from: targets, or targets_xy from older converters. */
+    _positionEntityId() {
+        if (!this._ids) return undefined;
+        return this._hass?.states[this._ids.targets] ? this._ids.targets : this._ids.targets_xy;
+    }
+
     /** When the positions were last refreshed: the last MQTT message, or the targets entity's last report. */
     _updatedAt(snap) {
         if (snap?.source === "mqtt") return this._mqttAt;
-        const s = this._ids && this._hass?.states[this._ids.targets_xy];
+        const s = this._hass?.states[this._positionEntityId()];
         return s ? Date.parse(s.last_reported || s.last_updated) || 0 : 0;
     }
 
@@ -1246,7 +1282,7 @@ export class Fp400MapCard extends Base {
         if (snap.presence != null) chips.push(`<span class="chip${snap.presence ? " on" : ""}">${snap.presence ? "Occupied" : "Empty"}</span>`);
         if (snap.humanCount != null) chips.push(`<span class="chip">${snap.humanCount} ${snap.humanCount === 1 ? "person" : "people"}</span>`);
         if (snap.targets) chips.push(`<span class="chip">${snap.targets.length} tracked</span>`);
-        if (snap.tracking === "partial") chips.push(`<span class="chip warn" title="The last position report was cut short; some targets may be missing">partial report</span>`);
+        if (snap.tracking === "partial") chips.push(`<span class="chip warn" title="The last position report, or its Home Assistant state, was cut short; some targets may be missing">partial report</span>`);
         const at = this._updatedAt(snap);
         if (at && snap.targets) {
             const s = Math.max(0, Math.round((Date.now() - at) / 1000));
@@ -2313,13 +2349,14 @@ export class Fp400MapCard extends Base {
         }
         const reason =
             this._why === "admin"
-                ? "zone outlines and speed need an admin account"
+                ? "zone outlines need an admin account"
                 : this._why === "no topic configured"
-                  ? "no topic is configured, so zone outlines and speed are not shown"
-                  : `could not listen to Zigbee2MQTT (${this._why}), so zone outlines and speed are not shown`;
+                  ? "no topic is configured, so zone outlines are not shown"
+                  : `could not listen to Zigbee2MQTT (${this._why}), so zone outlines are not shown`;
         if (!snap.targets) {
-            const exists = Boolean(this._ids && this._hass?.states[this._ids.targets_xy]);
-            return `Reduced view: ${reason}. ${exists ? "No positions yet." : `No position entity (${this._ids?.targets_xy}): is tracking on?`}`;
+            const id = this._positionEntityId();
+            const exists = Boolean(this._hass?.states[id]);
+            return `Reduced view: ${reason}. ${exists ? "No positions yet." : `No position entity (${id}): is tracking on?`}`;
         }
         return `Reduced view from Home Assistant entities: ${reason}.`;
     }

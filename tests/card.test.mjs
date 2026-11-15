@@ -28,7 +28,9 @@ import {
     normalizeConfig,
     outlineSegments,
     parseTargets,
+    parseTargetsText,
     parseTargetsXy,
+    targetsTextCut,
     parseZones,
     snapshotFromPayload,
     snapshotFromStates,
@@ -136,6 +138,23 @@ test("targets: payload list and targets_xy text", () => {
     assert.equal(parseTargetsXy("0:1:2;junk"), null);
 });
 
+test("targets entity text: Python or JSON, cut at 255 characters", () => {
+    // How Home Assistant shows the list (made-up positions).
+    const text = "[{'id': 0, 'x': 120, 'y': 175, 'zone': 1}, {'id': 2, 'x': -40, 'y': 260, 'zone': 0, 'speed': 3, 'leaving': False}]";
+    assert.deepEqual(parseTargetsText(text), [
+        {id: 0, x: 120, y: 175, zone: 1},
+        {id: 2, x: -40, y: 260, zone: 0, speed: 3, leaving: false},
+    ]);
+    assert.equal(targetsTextCut(text), false);
+    assert.deepEqual(parseTargetsText('[{"id": 5, "x": -7, "y": 300}]'), [{id: 5, x: -7, y: 300}]);
+    assert.deepEqual(parseTargetsText("[]"), []);
+    // Cut inside the second target: the first is kept, the second left out.
+    const cut = "[{'id': 0, 'x': 120, 'y': 175, 'zone': 1}, {'id': 2, 'x': -4";
+    assert.deepEqual(parseTargetsText(cut), [{id: 0, x: 120, y: 175, zone: 1}]);
+    assert.equal(targetsTextCut(cut), true);
+    for (const unknown of [null, undefined, "", "unknown", "unavailable"]) assert.equal(parseTargetsText(unknown), null);
+});
+
 test("every fixture's targets_xy matches its targets list", () => {
     for (const {payload} of fixtures) {
         const xy = parseTargetsXy(payload.targets_xy);
@@ -182,6 +201,13 @@ test("snapshot from Home Assistant entities (the reduced view)", () => {
     assert.deepEqual(s.zoneState, {1: {occupied: true, count: 2}, 2: {occupied: false, count: null}});
     assert.equal(s.masks.edge, last.edge_mask_hex);
     assert.equal(snapshotFromStates({}, ids).targets, null);
+    // Newer converters have a targets entity; it comes first, and a cut one makes the report partial.
+    const list = {...states, [ids.targets]: {state: "[{'id': 7, 'x': 10, 'y': 200, 'zone': 0}, {'id': 8, 'x"}};
+    const fromList = snapshotFromStates(list, ids);
+    assert.deepEqual(fromList.targets, [{id: 7, x: 10, y: 200, zone: 0}]);
+    assert.equal(fromList.tracking, "partial");
+    assert.equal(snapshotFromStates({...states, [ids.targets]: {state: "[]"}}, ids).tracking, null);
+    assert.equal(snapshotFromStates({...states, [ids.targets]: {state: "unknown"}}, ids).targets.length, 2);
     assert.equal(entityIds("dev", {targets_xy: "sensor.other", zone_count: "nope"}).targets_xy, "sensor.other");
     assert.equal(typeof entityIds("dev", {zone_count: "nope"}).zone_count, "function");
 });

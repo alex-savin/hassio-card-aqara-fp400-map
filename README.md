@@ -5,7 +5,7 @@ map of its room: the area it monitors, its entrance and interference cells, its 
 and the people it tracks, each with a short trail. Admins can also edit the zones and areas, forget a target or ignore
 its spot, and change the sensor's settings, all from the card. The map zooms and pans.
 
-- Live positions of every tracked target, with its zone, speed and whether the sensor is dropping it
+- Live positions of every tracked target, with the sensor's zone it is in
 - The monitored area, entrances and interference cells, drawn and edited on the sensor's 50 cm grid
 - The sensor's own zones (up to 8) with occupancy and people count: create, reshape and delete them on the map
 - Software zones (rectangles Zigbee2MQTT checks the positions against), drawn and edited the same way
@@ -19,8 +19,9 @@ its spot, and change the sensor's settings, all from the card. The map zooms and
 - Home Assistant with the MQTT integration, and Zigbee2MQTT on the same broker.
 - FP400 support in Zigbee2MQTT. It comes with zigbee-herdsman-converters: the device itself arrives with
   [Koenkk/zigbee-herdsman-converters#13812](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13812) (presence,
-  light, people count, activity, settings). Target positions, the detection areas, the sensor's own zones, movement
-  events, software zones and settings restore follow in later pull requests.
+  light, people count, activity, settings). Target positions follow in
+  [#13836](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13836); the detection areas, the sensor's own zones,
+  movement events, software zones and settings restore in later pull requests.
 
 The card draws what the converter publishes and leaves out the rest, so parts of the map stay empty until the
 converter has them and the matching device options are on in Zigbee2MQTT:
@@ -66,7 +67,7 @@ refresh_on_open: true                     # optional; see "Opening the card in a
 zone_editor: true                         # optional; false hides the editor, settings and dot popover
 base_topic: zigbee2mqtt                   # optional; Zigbee2MQTT's base topic, default the topic's first part
 entities:                                 # optional; override any derived entity id
-  targets_xy: sensor.lounge_targets_xy
+  targets: sensor.lounge_targets
 room:                                     # optional; the room in the sensor's frame, in mm
   outline_mm: [[x, y], ...]               # the wall line, closed automatically
   features:                               # door | opening | window | glass | wall | furniture | fixture
@@ -87,15 +88,16 @@ an outline, the room is framed.
 
 | Viewer | Source | Shows |
 |---|---|---|
-| Admin user | The device's Zigbee2MQTT topic, through Home Assistant's websocket (`mqtt/subscribe`) | Everything: all targets with zone and speed, masks, zone outlines |
-| Anyone else, or no `topic`, or the subscription fails | The device's Home Assistant entities | Reduced view: positions from `targets_xy`, masks, presence, counts, zone outlines and occupancy, software zones. No speed, no editing |
+| Admin user | The device's Zigbee2MQTT topic, through Home Assistant's websocket (`mqtt/subscribe`) | Everything: all targets with their zone, masks, zone outlines |
+| Anyone else, or no `topic`, or the subscription fails | The device's Home Assistant entities | Reduced view: positions from `targets`, masks, presence, counts, zone outlines and occupancy, software zones. No editing |
 
 Home Assistant only lets admin users listen to MQTT topics, which is why there are two views.
 
 **Positions and the database.** In the live view, positions go from MQTT straight to the browser. They never become
 Home Assistant states, so they never reach the recorder. Trails are kept in the browser's memory only and are gone on
-reload. The reduced view reads `sensor.<prefix>_targets_xy`, so exclude that entity from the recorder if positions
-must not be stored:
+reload. The reduced view reads `sensor.<prefix>_targets`, so exclude that entity from the recorder if positions
+must not be stored. Home Assistant cuts its state at 255 characters, about six targets; the card then marks the report
+partial.
 
 ```yaml
 recorder:
@@ -105,7 +107,7 @@ recorder:
 ```
 
 **Entities used by the reduced view** (with `entity_prefix: dev`): `binary_sensor.dev_occupancy_1`,
-`sensor.dev_human_count`, `sensor.dev_target_count`, `sensor.dev_tracking_status`, `sensor.dev_targets_xy`,
+`sensor.dev_human_count`, `sensor.dev_targets` (or `sensor.dev_targets_xy` from earlier test builds of the converter),
 `text.dev_edge_mask_hex`, `text.dev_entry_exit_mask_hex`, `text.dev_interference_mask_hex`,
 `binary_sensor.dev_native_zone_N_occupancy`, `sensor.dev_native_zone_N_count`, and for zone outlines
 `sensor.dev_configured_zones_compact` (`configured_zones` itself is cut at Home Assistant's 255 characters), the software
@@ -192,8 +194,6 @@ closes it.
 - **Ignore this spot** opens the Interference layer with the 2 × 2 cells around the dot (the 1 × 1 m block centred on
   the nearest grid corner) added to the draft. Nothing is written until **Save**.
 
-Targets the sensor is dropping (`leaving`) are drawn faded and listed as leaving.
-
 ### Settings
 
 **Settings** (next to **Edit zones and areas**) opens a panel with the device's options. Each change is written at once
@@ -231,12 +231,13 @@ python3 -m http.server 8765 --bind 127.0.0.1          # then open:
 | Scenario (with `&frame=60`) | Checks |
 |---|---|
 | `edit` | the sensor's zones: create, reshape, settings, errors, delete |
-| `areas` | monitored area, entrances, interference; leaving targets |
+| `areas` | monitored area, entrances, interference |
 | `zones` (with `&config=study&fixtures=no-zones&frame=6`) | a sensor that never had a zone |
 | `software` | software zones: draw, name, create, rename, errors, delete, turned zones, reduced view |
 | `settings` | the settings panel, room learning, restore status |
 | `dot` | the dot popover: forget, ignore this spot, errors |
 | `view` | wheel, drag, pinch, double-click, Fit, ceiling framing, a leftover `map_rotation` ignored |
+| `reduced` | the reduced view reading positions from the `targets` entity (Python text, cut at 255 characters) |
 
 `&software=1` makes the fake device publish software zones (`=demo` adds two); `&stay=software|settings|pop|zoom|ceiling`
 leaves that view open after its scenario, for a screenshot.
