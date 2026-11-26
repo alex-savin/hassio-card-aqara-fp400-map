@@ -2,7 +2,7 @@
 // Nothing here comes from a real home: two invented rooms, and people walking scripted paths with seeded noise.
 // The output is deterministic, so running it again reproduces the committed files.
 import {writeFileSync} from "node:fs";
-import {bitsToHex, CELLS, COLS, cellAt, invertBits, roomCells} from "../fp400-map-card.js";
+import {bitsToHex, CELLS, COLS, cellAt, invertBits, roomCells, ZONE_ENDPOINTS} from "../fp400-map-card.js";
 
 const out = (path, value) => writeFileSync(new URL(path, import.meta.url), `${JSON.stringify(value, null, 2)}\n`);
 /** A list of messages, one per line: small, and a diff shows which message changed. */
@@ -146,11 +146,13 @@ function stream({people, zones, seconds, start, base, rand}) {
         payload.occupancy_1 = s - lastSeen.room < payload.absence_timeout;
         payload.human_count = targets.filter((t) => !t.leaving).length;
         payload.activity_state = targets.length === 0 ? "none" : targets.some((t) => t.speed) ? "active" : "still";
-        for (const z of zones) {
-            const inside = targets.filter((t) => t.zone === z.zone_id);
-            if (inside.length) lastSeen[z.zone_id] = s;
-            payload[`native_zone_${z.zone_id}_count`] = inside.length;
-            payload[`native_zone_${z.zone_id}_occupancy`] = s - lastSeen[z.zone_id] < payload[`zone_${z.zone_id}_absence_timeout`];
+        // Per zone endpoint, as firmware 63 answers: endpoint N carries zone N - 2, and those without a zone answer too.
+        for (const n of ZONE_ENDPOINTS) {
+            const zoneId = n - 2;
+            const inside = zones.some((z) => z.zone_id === zoneId) ? targets.filter((t) => t.zone === zoneId) : [];
+            if (inside.length) lastSeen[zoneId] = s;
+            payload[`human_count_${n}`] = inside.length;
+            payload[`occupancy_${n}`] = s - (lastSeen[zoneId] ?? -Infinity) < payload[`absence_timeout_${n}`];
         }
         payload.target_count = targets.length;
         payload.targets = targets;
@@ -173,29 +175,23 @@ const settings = {
     installation_height_max: 0,
     installation_height_min: 0,
     installation_mode: "wall",
-    learning_reporting_timeout: 20,
-    maximum_detection_targets: 10,
-    maximum_zones: 8,
     presence_sensitivity: "high",
     proximity_distance: "medium",
     update: {installed_version: -1, latest_version: -1},
+    // Every zone endpoint, with or without a zone: the zone it carries and its two settings.
+    ...Object.fromEntries(ZONE_ENDPOINTS.flatMap((n) => [[`zone_id_${n}`, n - 2], [`absence_timeout_${n}`, 10], [`presence_sensitivity_${n}`, "medium"]])),
 };
 
 const loungeBase = {
     ...settings,
     ...loungeMasks,
-    configured_zone_count: loungeZones.length,
-    configured_zones: loungeZones.map((z) => ({enabled: true, mask_hex: mask(z.cells), zone_id: z.zone_id, zone_type: 0})),
-    // A monitored area drawn cell by cell has no single depth.
-    detection_depth: null,
     illuminance_2: 210,
     installation_angle: 12,
     installation_height: 2100,
     installation_status: "side_facing_forward",
     linkquality: 150,
-    native_zone_endpoints: [3, 4, 5],
+    native_zones: loungeZones.map((z) => ({zone_id: z.zone_id, mask_hex: mask(z.cells), enabled: true})),
     side_installation: "wall",
-    ...Object.fromEntries(loungeZones.flatMap((z) => [[`zone_${z.zone_id}_absence_timeout`, 10], [`zone_${z.zone_id}_sensitivity`, "medium"]])),
 };
 
 out("../examples/lounge.json", lounge);
@@ -240,7 +236,6 @@ const studyBase = {
     edge_mask_hex: bitsToHex(invertBits(roomCells(cm(study.room.outline_mm)))),
     entry_exit_mask_hex: mask([[cellAt(...studyCm(4500, 3050)) >> 4, cellAt(...studyCm(4500, 3050)) & 15]]),
     interference_mask_hex: "0".repeat(80),
-    detection_depth: null,
     illuminance_2: 95,
     installation_angle: 20,
     installation_height: 2200,

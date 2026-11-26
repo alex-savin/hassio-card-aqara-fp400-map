@@ -23,8 +23,12 @@
  * This file shares no code or state with any other card.
  */
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 const TAG = "fp400-map-card";
+
+/** The sensor holds up to 8 zones, each carried by one of endpoints 3-10 (`zone_id_N` tells which). */
+export const MAX_ZONES = 8;
+export const ZONE_ENDPOINTS = [3, 4, 5, 6, 7, 8, 9, 10];
 
 /* ── The sensor's grid ─────────────────────────────────────────────────────────────────────────────────────
  * 20 rows of 16 cells, 50 cm square. Row 0 is nearest the sensor; column 0 is x = +350..+400 cm, so x = 0 falls
@@ -173,26 +177,6 @@ export function roomCells(outline) {
         if (n >= 50) bits[i] = 1;
     }
     return bits;
-}
-
-/** Zones from `configured_zones_compact` (`id[!]:first byte:hex;…`), the zone list in a form that fits Home Assistant. */
-export function parseZonesCompact(value) {
-    if (typeof value !== "string") return null;
-    const s = value.trim();
-    if (s === "none") return [];
-    // "" is what Home Assistant shows while the key has never been published.
-    if (s === "" || s === "unknown" || s === "unavailable") return null;
-    const out = [];
-    for (const part of s.split(";")) {
-        const m = /^(\d+)(!?):(\d+):([0-9a-f]*)$/i.exec(part.trim());
-        if (!m) return null;
-        const start = Number(m[3]);
-        const hex = m[4].toLowerCase();
-        if (hex.length % 2 || start + hex.length / 2 > CELLS / 8) return null;
-        const full = "00".repeat(start) + hex + "00".repeat(CELLS / 8 - start - hex.length / 2);
-        out.push({id: Number(m[1]), enabled: m[2] !== "!", bits: maskBits(full), hex: full});
-    }
-    return out.sort((a, b) => a.id - b.id);
 }
 
 /* ── Software zones (computed by the converter from positions) ─────────────────────────────────────────── */
@@ -391,7 +375,7 @@ export function targetsTextCut(state) {
     return typeof state === "string" && state.trim().startsWith("[") && !state.trim().endsWith("]");
 }
 
-/** Zones from the payload's `configured_zones`. */
+/** Zones from the payload's `native_zones`, the sensor's zone list. */
 export function parseZones(list) {
     if (!Array.isArray(list)) return null;
     const out = [];
@@ -404,23 +388,26 @@ export function parseZones(list) {
     return out.sort((a, b) => a.id - b.id);
 }
 
-/** One snapshot of everything the card draws, from a Zigbee2MQTT device message. */
+/** The zone an endpoint carries (its `zone_id_N`), or null. */
+const zoneOfEndpoint = (v) => (Number.isInteger(v) && v >= 1 && v <= MAX_ZONES ? v : null);
+
+/**
+ * One snapshot of everything the card draws, from a Zigbee2MQTT device message. Zone state and settings are published
+ * per endpoint (`occupancy_N`, `human_count_N`, `presence_sensitivity_N`, `absence_timeout_N`, N = 3..10) and keyed
+ * here by the zone the endpoint carries. Endpoints without a zone answer too (firmware 63), so only the zone list tells
+ * which zones exist.
+ */
 export function snapshotFromPayload(p) {
     const zoneState = {};
     const zoneSettings = {};
-    for (const key of Object.keys(p)) {
-        const s = /^zone_(\d+)_(sensitivity|absence_timeout)$/.exec(key);
-        if (s) {
-            zoneSettings[s[1]] ??= {sensitivity: null, timeout: null};
-            if (s[2] === "sensitivity") zoneSettings[s[1]].sensitivity = typeof p[key] === "string" ? p[key] : null;
-            else zoneSettings[s[1]].timeout = numberOrNull(p[key]);
-            continue;
-        }
-        const m = /^native_zone_(\d+)_(occupancy|count)$/.exec(key);
-        if (!m) continue;
-        zoneState[m[1]] ??= {occupied: null, count: null};
-        if (m[2] === "occupancy") zoneState[m[1]].occupied = boolOrNull(p[key]);
-        else zoneState[m[1]].count = numberOrNull(p[key]);
+    const zoneEndpoints = {};
+    for (const n of ZONE_ENDPOINTS) {
+        const zone = zoneOfEndpoint(p[`zone_id_${n}`]);
+        if (zone === null) continue;
+        zoneEndpoints[zone] = n;
+        zoneState[zone] = {occupied: boolOrNull(p[`occupancy_${n}`]), count: numberOrNull(p[`human_count_${n}`])};
+        const sensitivity = p[`presence_sensitivity_${n}`];
+        zoneSettings[zone] = {sensitivity: typeof sensitivity === "string" ? sensitivity : null, timeout: numberOrNull(p[`absence_timeout_${n}`])};
     }
     const masks = {edge: p.edge_mask_hex, entry: p.entry_exit_mask_hex, interference: p.interference_mask_hex};
     return {
@@ -431,13 +418,12 @@ export function snapshotFromPayload(p) {
         tracking: typeof p.tracking_status === "string" ? p.tracking_status : null,
         targets: parseTargets(p.targets),
         masks,
-        zones: parseZones(p.configured_zones),
+        zones: parseZones(p.native_zones),
         zoneState,
         zoneSettings,
-        maxZones: Number.isInteger(p.maximum_zones) && p.maximum_zones > 0 ? Math.min(p.maximum_zones, 8) : 8,
+        zoneEndpoints,
         softwareZones: softwareZonesFromPayload(p),
         settings: Object.fromEntries(SETTING_KEYS.filter((k) => k in p).map((k) => [k, p[k]])),
-        learning: "learning_state" in p || "learning_result_code" in p ? {state: p.learning_state ?? null, code: p.learning_result_code ?? null} : null,
         restore: "restore_status" in p ? {status: p.restore_status ?? null, error: p.restore_error ?? ""} : null,
     };
 }
@@ -452,13 +438,14 @@ export function entityIds(prefix, overrides = {}) {
         tracking_status: `sensor.${p}_tracking_status`,
         targets: `sensor.${p}_targets`,
         targets_xy: `sensor.${p}_targets_xy`,
-        zones_compact: `sensor.${p}_configured_zones_compact`,
         edge_mask: `text.${p}_edge_mask_hex`,
         entry_exit_mask: `text.${p}_entry_exit_mask_hex`,
         interference_mask: `text.${p}_interference_mask_hex`,
         installation_mode: `select.${p}_installation_mode`,
-        zone_occupancy: (n) => `binary_sensor.${p}_native_zone_${n}_occupancy`,
-        zone_count: (n) => `sensor.${p}_native_zone_${n}_count`,
+        // Per zone endpoint, N = 3..10.
+        zone_id: (n) => `sensor.${p}_zone_id_${n}`,
+        zone_occupancy: (n) => `binary_sensor.${p}_occupancy_${n}`,
+        zone_count: (n) => `sensor.${p}_human_count_${n}`,
         software_config: (n) => `text.${p}_software_zone_${n}_config`,
         software_occupancy: (n) => `binary_sensor.${p}_software_zone_${n}_occupancy`,
         software_count: (n) => `sensor.${p}_software_zone_${n}_count`,
@@ -482,11 +469,13 @@ export function snapshotFromStates(states, ids) {
         const v = value(id);
         return v === "on" ? true : v === "off" ? false : null;
     };
+    // Keyed by the zone each endpoint carries. Home Assistant has no zone list, so zones that do not exist are here too.
     const zoneState = {};
-    for (let n = 1; n <= 8; n++) {
+    for (const n of ZONE_ENDPOINTS) {
+        const zone = zoneOfEndpoint(num(ids.zone_id(n)));
         const occupied = onOff(ids.zone_occupancy(n));
-        if (occupied === null) continue;
-        zoneState[n] = {occupied, count: num(ids.zone_count(n))};
+        if (zone === null || occupied === null) continue;
+        zoneState[zone] = {occupied, count: num(ids.zone_count(n))};
     }
     // The targets list (cut at 255 characters), or targets_xy from older converters.
     const listEntity = states[ids.targets];
@@ -519,12 +508,11 @@ export function snapshotFromStates(states, ids) {
         tracking: cut ? "partial" : value(ids.tracking_status),
         targets,
         masks: {edge: value(ids.edge_mask), entry: value(ids.entry_exit_mask), interference: value(ids.interference_mask)},
-        // The zone list entity is cut at 255 characters; configured_zones_compact fits (newer converters publish it).
-        zones: parseZonesCompact(states[ids.zones_compact]?.state),
+        // The zone list (native_zones) has no Home Assistant entity, so the reduced view draws no zone outlines.
+        zones: null,
         zoneState,
         softwareZones: softwareZones.length ? softwareZones : null,
         settings,
-        learning: null,
         restore: null,
     };
 }
@@ -819,8 +807,8 @@ export class Fp400MapCard extends Base {
     _entityRefs() {
         if (!this._hass || !this._ids) return [];
         const ids = this._ids;
-        const list = [ids.presence, ids.human_count, ids.target_count, ids.tracking_status, ids.targets, ids.targets_xy, ids.edge_mask, ids.entry_exit_mask, ids.interference_mask, ids.zones_compact, ids.installation_mode];
-        for (let n = 1; n <= 8; n++) list.push(ids.zone_occupancy(n), ids.zone_count(n));
+        const list = [ids.presence, ids.human_count, ids.target_count, ids.tracking_status, ids.targets, ids.targets_xy, ids.edge_mask, ids.entry_exit_mask, ids.interference_mask, ids.installation_mode];
+        for (const n of ZONE_ENDPOINTS) list.push(ids.zone_id(n), ids.zone_occupancy(n), ids.zone_count(n));
         for (let n = 1; n <= SOFTWARE_ZONES; n++) list.push(ids.software_config(n), ids.software_occupancy(n), ids.software_count(n), ids.software_activity(n));
         return list.map((id) => this._hass.states[id]);
     }
@@ -874,9 +862,10 @@ export class Fp400MapCard extends Base {
     }
 
     /**
-     * A sensor that never had a zone has published no zone list, and the editor needs one: without it, "New zone" could
-     * overwrite a zone it does not know about. Read the list once (one Zigbee read; it comes back only with the device's
-     * native_zones option on). A sensor without zones answers it with `[]`.
+     * The editor needs the sensor's zone list: without it, "New zone" could overwrite a zone it does not know about.
+     * Zigbee2MQTT reads the list on its first poll and after each change; when a message comes without it, read it once
+     * (one Zigbee read). A sensor without zones answers with `[]`. On an Ember coordinator a list of two zones or more
+     * never arrives (it takes more than one frame), so the zone layer stays closed there.
      */
     _requestZones() {
         const c = this._config;
@@ -886,7 +875,7 @@ export class Fp400MapCard extends Base {
         const now = Date.now();
         if (now - (lastRefresh.get(key) || 0) < 60000) return;
         lastRefresh.set(key, now);
-        this._hass.callService("mqtt", "publish", {topic: `${c.topic}/get`, payload: JSON.stringify({configured_zones: ""})}).catch(() => {});
+        this._hass.callService("mqtt", "publish", {topic: `${c.topic}/get`, payload: JSON.stringify({native_zones: ""})}).catch(() => {});
     }
 
     _onMessage(message) {
@@ -1292,13 +1281,13 @@ export class Fp400MapCard extends Base {
         this._set(el.info, chips.join(""));
 
         const rows = [];
-        // Zigbee2MQTT keeps a removed zone's last values, so the reduced view lists only the zones named in the card, when
-        // it names any; the live view lists the sensor's own zone list.
+        // The sensor's zone list when it is known (the live view). Without it, only the zones named in the card: every zone
+        // endpoint answers, also those without a zone.
         const named = Object.keys(c.zones);
         const zoneIds = snap.zones
             ? snap.zones.map((z) => z.id)
             : Object.keys(snap.zoneState)
-                  .filter((id) => !named.length || named.includes(id))
+                  .filter((id) => named.includes(id))
                   .map(Number)
                   .sort((a, b) => a - b);
         if (zoneIds.length) {
@@ -1477,9 +1466,9 @@ export class Fp400MapCard extends Base {
 
     /* ── Zone editor (admins, live view) ──────────────────────────────────────────────────────────────────
      * Writes go to `<topic>/set` through mqtt.publish: `native_zone` {zone_id, mask_hex} creates or changes a zone,
-     * `native_zone_remove` deletes one, `zone_N_sensitivity` / `zone_N_absence_timeout` set its options. A write counts
-     * as done only when the sensor's own zone list (or the setting) comes back with the new value; an error Zigbee2MQTT
-     * logs for this device in the meantime (`<base>/bridge/logging`) is shown instead. */
+     * `native_zone_remove` deletes one, `presence_sensitivity_N` / `absence_timeout_N` set its options on the endpoint N
+     * that carries it. A write counts as done only when the sensor's own zone list (or the setting) comes back with the
+     * new value; an error Zigbee2MQTT logs for this device in the meantime (`<base>/bridge/logging`) is shown instead. */
 
     /** Whether this card may write to the device: an admin in the live view, with the editor not turned off. */
     _writesAllowed() {
@@ -1559,7 +1548,7 @@ export class Fp400MapCard extends Base {
 
     _newZoneId() {
         const used = new Set(this._zones().map((z) => z.id));
-        for (let id = 1; id <= (this._mqtt?.maxZones || 8); id++) if (!used.has(id)) return id;
+        for (let id = 1; id <= MAX_ZONES; id++) if (!used.has(id)) return id;
         return null;
     }
 
@@ -1837,10 +1826,13 @@ export class Fp400MapCard extends Base {
         const list = [["zone", "Zones"]];
         if (this._layerAvailable("software")) list.push(["software", "Software zones"]);
         list.push(...Object.entries(AREAS).map(([layer, area]) => [layer, area.name]));
-        const layers = list.map(
-            ([layer, label]) =>
-                `<button class="btn${e.layer === layer ? " sel" : ""}" data-action="layer" data-layer="${layer}"${busy || !this._layerAvailable(layer) ? " disabled" : ""}>${label}</button>`,
-        );
+        // Without the zone list the zones cannot be edited (a new zone could overwrite an unknown one).
+        const noList = "The sensor's zone list has not arrived. Zigbee2MQTT on an Ember coordinator cannot read it once the sensor has two zones or more.";
+        const layers = list.map(([layer, label]) => {
+            const open = this._layerAvailable(layer);
+            const title = layer === "zone" && !open ? ` title="${esc(noList)}"` : "";
+            return `<button class="btn${e.layer === layer ? " sel" : ""}" data-action="layer" data-layer="${layer}"${title}${busy || !open ? " disabled" : ""}>${label}</button>`;
+        });
         const body = e.layer === "zone" ? this._zoneEditorHtml(e, busy, dis) : e.layer === "software" ? this._softEditorHtml(e, busy, dis) : this._areaEditorHtml(e, busy, dis);
         const msg = e.message ? `<div class="msg ${e.message.kind}">${esc(e.message.text)}</div>` : "";
         this._set(el.editor, `<div class="bar layers">${layers.join("")}</div>${body}${msg}`);
@@ -1916,12 +1908,8 @@ export class Fp400MapCard extends Base {
         // One grid for every section, so the controls line up.
         const grid = [];
         for (const [name, rows] of sections) grid.push(`<div class="sh">${name}</div>`, ...rows);
-        // Learning: the sensor maps the empty room; it answers "accepted", later "result_received" with a code.
-        const l = snap.learning;
-        const learnState = !l ? "" : l.state === "accepted" ? "Learning: the sensor accepted the request." : l.state === "result_received" ? `Finished, result code ${l.code ?? "?"}.` : esc(String(l.state ?? ""));
-        grid.push(
-            `<div class="sh">Room learning</div><div class="wide bar"><button class="btn" data-action="learn"${dis}>Learn the empty room</button>${learnState ? `<span class="hint">${learnState}</span>` : ""}</div>`,
-        );
+        // Learning: the sensor maps the empty room. The converter publishes no progress, so the card only sends the start.
+        grid.push(`<div class="sh">Room learning</div><div class="wide bar"><button class="btn" data-action="learn"${dis}>Learn the empty room</button></div>`);
         if (snap.restore) {
             const r = snap.restore;
             grid.push(`<div class="sh">Restore</div><span class="k">Status</span><span class="v">${esc(String(r.status ?? "unknown"))}</span>`);
@@ -1971,7 +1959,7 @@ export class Fp400MapCard extends Base {
         const freeId = this._newZoneId();
         if (e.isNew) chips.push(`<button class="btn sel" disabled>${name} (new)</button>`);
         else {
-            const title = freeId == null ? `The sensor holds at most ${this._mqtt.maxZones} zones` : `Create zone ${freeId}`;
+            const title = freeId == null ? `The sensor holds at most ${MAX_ZONES} zones` : `Create zone ${freeId}`;
             chips.push(`<button class="btn" data-action="new" title="${title}"${freeId == null || busy ? " disabled" : ""}>+ New zone</button>`);
         }
         const check = zoneCheck(e.draft, zones, e.id, maskBits(this._mqtt.masks.edge));
@@ -1981,10 +1969,10 @@ export class Fp400MapCard extends Base {
             warns.push(`Shares cells with ${names}. The sensor accepts overlapping zones; how it counts someone in a shared cell is untested.`);
         }
         if (check.outside) warns.push(`${check.outside} cell${check.outside === 1 ? " is" : "s are"} outside the monitored area, where the sensor ignores movement.`);
-        // The sensor pushes changes for room presence and four more things; the converter gives zones their slots before the light.
+        // The sensor pushes changes for five things: room presence, the light, and three zones; the converter gives the
+        // first three zones those entries.
         const count = zones.length + (e.isNew ? 1 : 0);
-        if (e.isNew && count === 4) warns.push("With 4 zones the light sensor gives up its reporting slot and is read once a minute instead.");
-        if (e.isNew && count >= 5) warns.push("The sensor pushes changes for at most 4 zones; with more, the others are read once a minute. The dots show every zone right away.");
+        if (e.isNew && count >= 4) warns.push("The sensor pushes changes for at most 3 zones; with more, the others are read once a minute. The dots show every zone right away.");
         const dirty = this._editDirty();
         const save = `<button class="btn primary" data-action="save"${!dirty || !check.cells || busy ? " disabled" : ""}>${e.isNew ? "Create zone" : "Save zone"}</button>`;
         const revert = dirty && !busy ? `<button class="btn" data-action="revert">Undo changes</button>` : "";
@@ -2000,12 +1988,15 @@ export class Fp400MapCard extends Base {
 
     _settingsHtml(id, busy) {
         const s = this._mqtt.zoneSettings?.[id] || {};
-        const dis = busy ? " disabled" : "";
+        // The settings live on the endpoint that carries the zone; until the sensor has said which, they cannot be written.
+        const known = this._mqtt.zoneEndpoints?.[id] != null;
+        const dis = busy || !known ? " disabled" : "";
         const options = ["low", "medium", "high"].map((v) => `<option value="${v}"${s.sensitivity === v ? " selected" : ""}>${v}</option>`).join("");
         const unknown = s.sensitivity == null ? `<option value="" selected>?</option>` : "";
         return (
             `<div class="bar"><label>Sensitivity <select data-setting="sensitivity"${dis}>${unknown}${options}</select></label>` +
-            `<label>Absence timeout <input type="number" min="0" max="300" step="1" data-setting="absence_timeout" value="${s.timeout ?? ""}"${dis}> s</label></div>`
+            `<label>Absence timeout <input type="number" min="0" max="300" step="1" data-setting="absence_timeout" value="${s.timeout ?? ""}"${dis}> s</label></div>` +
+            (known ? "" : `<div class="hint">The zone's settings can be changed once the sensor reports which endpoint carries it, within a minute.</div>`)
         );
     }
 
@@ -2021,8 +2012,10 @@ export class Fp400MapCard extends Base {
         }
         if (action === "learn") {
             if (this._busy || !this._panel) return;
-            if (!confirm("Start learning the empty room? Leave the room empty until the sensor reports a result.")) return;
-            return this._send({spatial_learning: "start"}, {kind: "learn", label: "Starting room learning…", done: "The sensor started learning the room. Keep it empty until a result is shown."}, this._panel);
+            if (!confirm("Start learning the empty room? Leave the room empty for a few minutes.")) return;
+            // Nothing comes back to confirm it: after 5 s without an error from Zigbee2MQTT the start counts as sent.
+            const sent = "Sent. The sensor reports no progress; keep the room empty for a few minutes.";
+            return this._send({spatial_learning: "start"}, {kind: "learn", label: "Starting room learning…", timeout: 5000, timeoutText: sent}, this._panel);
         }
         const e = this._edit;
         if (!e) return;
@@ -2107,18 +2100,20 @@ export class Fp400MapCard extends Base {
         const which = ev.target.dataset?.setting;
         const e = this._edit;
         if (!which || !e || e.layer !== "zone" || e.isNew || e.pending) return;
+        const endpoint = this._mqtt?.zoneEndpoints?.[e.id];
+        if (endpoint == null) return;
         const name = this._zoneName(e.id);
         if (which === "sensitivity") {
             const value = ev.target.value;
             if (!["low", "medium", "high"].includes(value)) return;
-            return this._send({[`zone_${e.id}_sensitivity`]: value}, {kind: "setting", id: e.id, key: "sensitivity", value, label: `Setting the sensitivity of ${name}…`, done: `${name}: sensitivity ${value}.`});
+            return this._send({[`presence_sensitivity_${endpoint}`]: value}, {kind: "setting", id: e.id, key: "sensitivity", value, label: `Setting the sensitivity of ${name}…`, done: `${name}: sensitivity ${value}.`});
         }
         const value = Math.round(Number(ev.target.value));
         if (ev.target.value === "" || !Number.isFinite(value) || value < 0 || value > 300) {
             e.message = {kind: "error", text: "The absence timeout must be 0 to 300 s."};
             return this._drawEditor();
         }
-        this._send({[`zone_${e.id}_absence_timeout`]: value}, {kind: "setting", id: e.id, key: "timeout", value, label: `Setting the absence timeout of ${name}…`, done: `${name}: absence timeout ${value} s.`});
+        this._send({[`absence_timeout_${endpoint}`]: value}, {kind: "setting", id: e.id, key: "timeout", value, label: `Setting the absence timeout of ${name}…`, done: `${name}: absence timeout ${value} s.`});
     }
 
     /** A control of the settings panel changed: write it (checked first, so nothing out of range is sent). */
@@ -2179,7 +2174,6 @@ export class Fp400MapCard extends Base {
         else if (p.kind === "soft") done = sameSoftwareZone(soft()?.config, p.zone);
         else if (p.kind === "soft-delete") done = Boolean(soft()) && soft().config === null;
         else if (p.kind === "config") done = p.key in snap.settings && sameSetting(snap.settings[p.key], p.value);
-        else if (p.kind === "learn") done = snap.learning?.state === "accepted";
         else if (p.kind === "forget") done = Array.isArray(snap.targets) && !snap.targets.some((t) => t.id === p.id);
         if (done) this._finishPending(true, p.done);
     }

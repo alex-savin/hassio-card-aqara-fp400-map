@@ -62,20 +62,12 @@ function statesFrom(p) {
         [`text.${DEVICE}_entry_exit_mask_hex`]: s(p.entry_exit_mask_hex),
         [`text.${DEVICE}_interference_mask_hex`]: s(p.interference_mask_hex),
     };
-    // configured_zones_compact as the converter publishes it, worked out from configured_zones.
-    if (Array.isArray(p.configured_zones)) {
-        const compact = p.configured_zones.map((z) => {
-            const hex = z.mask_hex.replace(/(00)+$/, "");
-            const start = hex.match(/^(00)*/)[0].length / 2;
-            return `${z.zone_id}${z.enabled === false ? "!" : ""}:${start}:${hex.slice(start * 2) || "00"}`;
-        });
-        states[`sensor.${DEVICE}_configured_zones_compact`] = s(compact.join(";") || "none");
-    }
-    // Zones the sensor has; Home Assistant shows the others as unknown, which the card leaves out.
-    for (let n = 1; n <= 8; n++) {
-        if (p[`native_zone_${n}_occupancy`] === undefined) continue;
-        states[`binary_sensor.${DEVICE}_native_zone_${n}_occupancy`] = s(p[`native_zone_${n}_occupancy`] ? "on" : "off");
-        states[`sensor.${DEVICE}_native_zone_${n}_count`] = s(p[`native_zone_${n}_count`]);
+    // Every zone endpoint (3-10): the zone it carries, its occupancy and count. The zone list has no entity.
+    for (let n = 3; n <= 10; n++) {
+        if (p[`zone_id_${n}`] === undefined) continue;
+        states[`sensor.${DEVICE}_zone_id_${n}`] = s(p[`zone_id_${n}`]);
+        states[`binary_sensor.${DEVICE}_occupancy_${n}`] = s(p[`occupancy_${n}`] ? "on" : "off");
+        states[`sensor.${DEVICE}_human_count_${n}`] = s(p[`human_count_${n}`]);
     }
     // Software zones (the device's software_zones option on): Home Assistant shows null as unknown.
     for (let n = 1; n <= 8; n++) {
@@ -135,10 +127,13 @@ if (scenario === "settings" || scenario === "view") Object.assign(sticky, {forge
 /** `/get` of the zone list on a sensor without zones, answered as a real sensor without zones answers it. */
 async function fakeGet(payload) {
     await wait(100);
-    if ("configured_zones" in payload && !current.configured_zones) {
-        Object.assign(sticky, {configured_zones: [], configured_zone_count: 0, native_zone_endpoints: []});
-    }
+    if ("native_zones" in payload && !current.native_zones) sticky.native_zones = [];
     emitState();
+}
+/** Changes the zone list where it lives: in the fixture's state, or in what a `/get` added (a sensor without zones). */
+function setZones(next, change) {
+    if ("native_zones" in sticky) sticky.native_zones = change(sticky.native_zones);
+    else next.native_zones = change(next.native_zones || []);
 }
 async function fakeZ2m(payload) {
     const [key] = Object.keys(payload);
@@ -166,25 +161,18 @@ async function fakeZ2m(payload) {
         next.target_count = next.targets.length;
         next.targets_xy = next.targets.map((t) => `${t.id}:${t.x}:${t.y}`).join(";") || "none";
     } else if ("spatial_learning" in payload) {
-        Object.assign(sticky, {learning_state: "accepted", learning_result_code: null});
-        emitState();
-        setTimeout(() => {
-            Object.assign(sticky, {learning_state: "result_received", learning_result_code: 0});
-            emitState();
-        }, 800);
+        // A command with no state: nothing is published.
         return;
     } else if (payload.native_zone) {
         const {zone_id, mask_hex} = payload.native_zone;
         // Like the sensor: a publish with the old list first (another message in flight), then the confirmed one.
         emitState();
         await wait(200);
-        next.configured_zones = next.configured_zones.filter((z) => z.zone_id !== zone_id).concat({enabled: true, mask_hex, zone_id, zone_type: 0}).sort((a, b) => a.zone_id - b.zone_id);
-        next[`zone_${zone_id}_sensitivity`] ??= "medium";
-        next[`zone_${zone_id}_absence_timeout`] ??= 10;
+        setZones(next, (zones) => zones.filter((z) => z.zone_id !== zone_id).concat({zone_id, mask_hex, enabled: true}).sort((a, b) => a.zone_id - b.zone_id));
     } else if (payload.native_zone_remove) {
-        next.configured_zones = next.configured_zones.filter((z) => z.zone_id !== payload.native_zone_remove);
+        setZones(next, (zones) => zones.filter((z) => z.zone_id !== payload.native_zone_remove));
     } else {
-        // zone_N_sensitivity / zone_N_absence_timeout and the device settings come back as sent; the converter's own
+        // presence_sensitivity_N / absence_timeout_N and the device settings come back as sent; the converter's own
         // settings (forget_still_targets) stay in its state.
         for (const [k, v] of Object.entries(payload)) {
             if (k in sticky) sticky[k] = v;
@@ -254,7 +242,7 @@ if (scenario === "dot") await dotScenario(cards[0].card);
 if (scenario === "view") await viewScenario(cards[0].card);
 if (scenario === "reduced") await reducedScenario(cards[2].card);
 
-/* ── The area editor, leaving targets and zone outlines in the reduced view (lounge) ── */
+/* ── The area editor, leaving targets and the zones in the reduced view (lounge) ── */
 async function areasScenario(card) {
     const results = [];
     const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
@@ -273,7 +261,10 @@ async function areasScenario(card) {
     };
     window.confirm = () => true;
 
-    check("The reduced view draws the lounge's three zones from the compact entity", cards[2].card.shadowRoot.querySelectorAll(".zones .zone").length === 3);
+    // Home Assistant has no zone list: the reduced view draws no zone outlines, and lists only the zones the card names.
+    const reducedRows = cards[2].card.shadowRoot.querySelector(".rows").textContent;
+    check("The reduced view draws no zone outlines (the zone list has no entity)", cards[2].card.shadowRoot.querySelectorAll(".zones .zone").length === 0);
+    check("…and lists the three named zones, not the empty endpoints", /Table/.test(reducedRows) && /Sofa/.test(reducedRows) && /Armchair/.test(reducedRows) && !/Zone 4/.test(reducedRows), reducedRows);
     click('.actions [data-action="open"]');
     check("The editor opens on zones, with the three areas as layers", card._edit.layer === "zone" && root.querySelectorAll('.editor [data-action="layer"]').length === 4);
 
@@ -329,8 +320,8 @@ async function zonesScenario(card) {
     await wait(500);
     const results = [];
     const check = (name, ok, detail = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
-    const gets = published.filter((p) => p.topic === `${config.topic}/get` && "configured_zones" in JSON.parse(p.payload));
-    check("The fixture has no zone list", !("configured_zones" in fixtures[start].payload));
+    const gets = published.filter((p) => p.topic === `${config.topic}/get` && "native_zones" in JSON.parse(p.payload));
+    check("The fixture has no zone list", !("native_zones" in fixtures[start].payload));
     check("Asked for the zone list once, for both admin cards", gets.length === 1, `${gets.length} reads`);
     check("Edit zones shown once the list is known", Boolean(card.shadowRoot.querySelector('.actions [data-action="open"]')));
     check("No Edit zones in the reduced view", !cards[2].card.shadowRoot.querySelector('[data-action="open"]'));
@@ -348,7 +339,7 @@ async function editScenario(card) {
     const $ = (s) => root.querySelector(s);
     const click = (s) => $(s).click();
     const sets = () => published.filter((p) => p.topic === `${config.topic}/set`).map((p) => p.payload);
-    const zoneHex = (id) => current.configured_zones.find((z) => z.zone_id === id)?.mask_hex;
+    const zoneHex = (id) => current.native_zones.find((z) => z.zone_id === id)?.mask_hex;
     const message = () => $(".editor .msg")?.textContent || "";
     const point = (r, c) => {
         const [X, Y] = card._T(400 - 50 * c - 25, 50 * r + 25);
@@ -362,7 +353,7 @@ async function editScenario(card) {
         svg.dispatchEvent(new PointerEvent("pointerup", point(...b)));
     };
     window.confirm = () => true;
-    const original = structuredClone(current.configured_zones);
+    const original = structuredClone(current.native_zones);
 
     check("Edit button shown to an admin in the live view", Boolean($('.actions [data-action="open"]')));
     check("No Edit button in the reduced view", !cards[2].card.shadowRoot.querySelector('[data-action="open"]'));
@@ -377,7 +368,7 @@ async function editScenario(card) {
     drag([2, 9], [3, 10]);
     const a = "00000000006000600000000000000000000000000000000000000000000000000000000000000000";
     check("Dragging a rectangle fills its cells", card._edit.draft.reduce((n, b) => n + b, 0) === 4 && [...card._edit.draft.keys()].filter((i) => card._edit.draft[i]).join() === "41,42,57,58");
-    check("A 4th zone says the light sensor moves to once a minute", /light sensor gives up its reporting slot/.test($(".editor").textContent));
+    check("A 4th zone says it is read once a minute", /pushes changes for at most 3 zones/.test($(".editor").textContent));
     click('[data-action="save"]');
     check("Saving shows progress and locks the editor", message().startsWith("Creating") && $('[data-action="close"]').disabled);
     await wait(250);
@@ -402,12 +393,13 @@ async function editScenario(card) {
     select.value = "high";
     select.dispatchEvent(new Event("change", {bubbles: true}));
     await wait(400);
-    check("Sensitivity is written and confirmed", sets().at(-1) === JSON.stringify({zone_4_sensitivity: "high"}) && /sensitivity high/.test(message()), message());
+    // Zone 4 is carried by endpoint 6.
+    check("Sensitivity is written to the zone's endpoint and confirmed", sets().at(-1) === JSON.stringify({presence_sensitivity_6: "high"}) && /sensitivity high/.test(message()), message());
     const timeout = $('input[data-setting="absence_timeout"]');
     timeout.value = "45";
     timeout.dispatchEvent(new Event("change", {bubbles: true}));
     await wait(400);
-    check("Absence timeout is written and confirmed", sets().at(-1) === JSON.stringify({zone_4_absence_timeout: 45}) && /45 s/.test(message()), message());
+    check("Absence timeout is written to the zone's endpoint and confirmed", sets().at(-1) === JSON.stringify({absence_timeout_6: 45}) && /45 s/.test(message()), message());
 
     window.__failNext = "The sensor answered updateZone with status 0x87";
     drag([2, 9], [2, 9]);
@@ -420,7 +412,7 @@ async function editScenario(card) {
     click('[data-action="delete"]');
     await wait(400);
     check("Delete sends native_zone_remove and is confirmed", sets().at(-1) === JSON.stringify({native_zone_remove: 4}) && !zoneHex(4) && /removed/.test(message()), message());
-    check("Zones 1-3 are untouched", JSON.stringify(current.configured_zones) === JSON.stringify(original));
+    check("Zones 1-3 are untouched", JSON.stringify(current.native_zones) === JSON.stringify(original));
 
     // Leave a draft on screen for the screenshot: a new zone by the window, sharing a cell with Armchair.
     click('[data-action="new"]');
@@ -608,9 +600,10 @@ async function settingsScenario(card) {
     check("A Zigbee2MQTT error is shown and the control goes back to the device's value", /Not applied: proximity_distance is not supported/.test(t.msg()) && $('[data-config="proximity_distance"]').value === prox, t.msg());
     click('[data-action="learn"]');
     await wait(400);
-    check("Learn the empty room sends spatial_learning start and is confirmed", JSON.stringify(t.sets().at(-1)) === '{"spatial_learning":"start"}' && /started learning/.test(t.msg()), t.msg());
-    await wait(900);
-    check("…and shows the result when it comes", /Finished, result code 0/.test($(".editor").textContent));
+    check("Learn the empty room sends spatial_learning start", JSON.stringify(t.sets().at(-1)) === '{"spatial_learning":"start"}' && /Starting room learning/.test(t.msg()), t.msg());
+    // Nothing comes back for it: without an error within 5 s the start counts as sent.
+    await wait(5000);
+    check("…and counts as sent after 5 s without an error", /Sent\. The sensor reports no progress/.test(t.msg()), t.msg());
     check("Restore status is shown, read-only", /RestoreStatusok/.test($(".editor").textContent.replace(/\s+/g, "")) && !$('[data-config="restore_status"]'));
     click('[data-action="close-settings"]');
     check("Done closes the panel", !$(".editor .panel") && Boolean($('.actions [data-action="settings"]')));

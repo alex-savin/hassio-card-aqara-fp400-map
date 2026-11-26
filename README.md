@@ -20,8 +20,10 @@ its spot, and change the sensor's settings, all from the card. The map zooms and
 - FP400 support in Zigbee2MQTT. It comes with zigbee-herdsman-converters: the device itself arrives with
   [Koenkk/zigbee-herdsman-converters#13812](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13812) (presence,
   light, people count, activity, settings). Target positions follow in
-  [#13836](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13836); the detection areas, the sensor's own zones,
-  movement events, software zones and settings restore in later pull requests.
+  [#13836](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13836); the sensor's own zones in
+  [#13890](https://github.com/Koenkk/zigbee-herdsman-converters/pull/13890); movement events, software zones and settings
+  restore in later pull requests. Card 0.6.0 reads the zones as #13890 publishes them (per endpoint); 0.5.0 read the
+  names of earlier test builds.
 
 The card draws what the converter publishes and leaves out the rest, so parts of the map stay empty until the
 converter has them and the matching device options are on in Zigbee2MQTT:
@@ -29,7 +31,7 @@ converter has them and the matching device options are on in Zigbee2MQTT:
 | On the map | Needs |
 |---|---|
 | Dots, trails, the popover | the device's `tracking` option |
-| The sensor's own zones | the device's `native_zones` option |
+| The sensor's own zones | nothing more (the converter always reads them) |
 | Software zones | the device's `software_zones` option |
 
 ## Install
@@ -44,11 +46,11 @@ converter has them and the matching device options are on in Zigbee2MQTT:
 ### Manually
 
 1. Copy `fp400-map-card.js` to `/config/www/`.
-2. Add the dashboard resource `/local/fp400-map-card.js?v=0.4.1` (type: JavaScript module). Change `?v=` on every
+2. Add the dashboard resource `/local/fp400-map-card.js?v=0.6.0` (type: JavaScript module). Change `?v=` on every
    update: browsers cache `/local/` files for a month.
 3. Add the card.
 
-The card's footnote ends with its version (`Card 0.4.1.`). If it shows an older one, the browser still has the old
+The card's footnote ends with its version (`Card 0.6.0.`). If it shows an older one, the browser still has the old
 file: reload the page (Companion app: Settings → Companion app → Debugging → Reset frontend cache).
 
 ## Configuration
@@ -89,7 +91,7 @@ an outline, the room is framed.
 | Viewer | Source | Shows |
 |---|---|---|
 | Admin user | The device's Zigbee2MQTT topic, through Home Assistant's websocket (`mqtt/subscribe`) | Everything: all targets with their zone, masks, zone outlines |
-| Anyone else, or no `topic`, or the subscription fails | The device's Home Assistant entities | Reduced view: positions from `targets`, masks, presence, counts, zone outlines and occupancy, software zones. No editing |
+| Anyone else, or no `topic`, or the subscription fails | The device's Home Assistant entities | Reduced view: positions from `targets`, masks, presence, counts, occupancy of the zones named in the card (no outlines), software zones. No editing |
 
 Home Assistant only lets admin users listen to MQTT topics, which is why there are two views.
 
@@ -108,10 +110,11 @@ recorder:
 
 **Entities used by the reduced view** (with `entity_prefix: dev`): `binary_sensor.dev_occupancy_1`,
 `sensor.dev_human_count`, `sensor.dev_targets` (or `sensor.dev_targets_xy` from earlier test builds of the converter),
-`text.dev_edge_mask_hex`, `text.dev_entry_exit_mask_hex`, `text.dev_interference_mask_hex`,
-`binary_sensor.dev_native_zone_N_occupancy`, `sensor.dev_native_zone_N_count`, and for zone outlines
-`sensor.dev_configured_zones_compact` (`configured_zones` itself is cut at Home Assistant's 255 characters), the software
-zones' four entities each (see below) and `select.dev_installation_mode`.
+`text.dev_edge_mask_hex`, `text.dev_entry_exit_mask_hex`, `text.dev_interference_mask_hex`, per zone endpoint
+(N = 3..10) `sensor.dev_zone_id_N` (the zone it carries), `binary_sensor.dev_occupancy_N` and `sensor.dev_human_count_N`,
+the software zones' four entities each (see below) and `select.dev_installation_mode`. The zone list (`native_zones`) has
+no entity, so the reduced view draws no zone outlines. Every zone endpoint answers, also those without a zone (firmware
+63), so the reduced view lists only the zones named in the card's `zones:`.
 
 **Opening the card in an empty room.** A quiet sensor sends nothing, so if no message arrives within 4 s of opening,
 the card asks Zigbee2MQTT for a fresh state once (`<topic>/get` `{"edge_mask_hex": ""}`, one Zigbee read of the
@@ -139,26 +142,30 @@ Hiding the editor from non-admins is a convenience, not a lock: Home Assistant l
 
 ### Zones
 
-- Pick a zone, or **+ New zone** (the lowest free number, up to the sensor's `maximum_zones`, 8).
+- Pick a zone, or **+ New zone** (the lowest free number, up to 8).
 - Tap a cell to add or remove it; drag to fill or clear a rectangle (starting on a drawn cell clears). The map keeps
   showing people, so you can stand where a zone should go and see your dot.
 - **Create zone** / **Save zone** sends `native_zone` `{zone_id, mask_hex}` to `<topic>/set`; **Delete zone** sends
-  `native_zone_remove`. Sensitivity and absence timeout are written as soon as they change (`zone_N_sensitivity`,
-  `zone_N_absence_timeout`).
+  `native_zone_remove`. Sensitivity and absence timeout are written as soon as they change, to the endpoint N that
+  carries the zone (`presence_sensitivity_N`, `absence_timeout_N`; `zone_id_N` tells which). A new zone's settings can be
+  changed once the sensor has reported its endpoint, within a minute.
 - A write counts as done only when the sensor's own zone list (or the setting) comes back with the new value. Zigbee2MQTT
   publishes a few intermediate states first, so the card waits for the exact cells. If Zigbee2MQTT logs an error for the
   device meanwhile (`<base_topic>/bridge/logging`, error level), the card shows it; after 20 s without either it says so.
 - Warnings, not blocks: cells shared with another zone, and cells outside the monitored area. The sensor accepts both
   (firmware 63); how it counts someone in a shared cell is untested.
-- Reporting: the sensor pushes changes for room presence and four more things. The converter shares these out again
-  after a zone is created or removed: zones first, then the light sensor. So with 4 zones the light is read once a
-  minute, and from a 5th zone on the extra zones are. The dots show every zone straight away, since each target carries
+- Reporting: the sensor pushes changes for five things: room presence, the light, and three zones. The converter gives
+  the zones the sensor has those three entries again after a zone is created or removed (also in the Aqara app); from a
+  4th zone on, the extra zones are read once a minute. The dots show every zone straight away, since each target carries
   its zone.
 - Zone names are not stored on the sensor: name the zones in the card's `zones:`.
-- The editor needs the sensor's zone list. A sensor that never had a zone has published none, so the card reads it once
-  (`<topic>/get` `{"configured_zones": ""}`, at most once a minute per page); the answer, `[]`, comes back only with the
-  device's `native_zones` option on. Until the list is known, **Edit zones** stays hidden, so a new zone can never
-  overwrite one the card does not know about.
+- The editor needs the sensor's zone list (`native_zones`). Zigbee2MQTT reads it on its first poll and after each
+  change; if a message comes without it, the card reads it once (`<topic>/get` `{"native_zones": ""}`, at most once a
+  minute per page). A sensor without zones answers `[]`. Until the list is known, the **Zones** layer stays closed, so a
+  new zone can never overwrite one the card does not know about.
+- Ember coordinators: from two zones on the list takes more than one frame, and Ember passes on only the first
+  ([Koenkk/zigbee-herdsman#1886](https://github.com/Koenkk/zigbee-herdsman/issues/1886)), so the list never arrives and
+  the **Zones** layer stays closed. Occupancy and counts of the named zones still show.
 
 ### Software zones
 
@@ -207,9 +214,9 @@ editor. Only settings whose key is in the device's state are shown:
 | Mounting | `installation_mode` (wall/ceiling), `side_installation` (wall/left_corner/right_corner), `installation_height` (mm) |
 | Map | `forget_still_targets` (0-240 min, 0 = off); kept by the converter, not the sensor |
 
-**Learn the empty room** sends `{"spatial_learning": "start"}` (after a confirmation: the room must be empty) and shows
-`learning_state` / `learning_result_code` as they come. `restore_status` / `restore_error` are shown read-only when the
-device publishes them.
+**Learn the empty room** sends `{"spatial_learning": "start"}` (after a confirmation: the room must be empty). The
+converter publishes no progress, so the start counts as sent when Zigbee2MQTT logs no error within 5 s.
+`restore_status` / `restore_error` are shown read-only when the device publishes them.
 
 ### Zoom and pan
 

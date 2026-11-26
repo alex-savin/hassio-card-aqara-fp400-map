@@ -20,7 +20,6 @@ import {
     entityIds,
     inverseTransform,
     invertBits,
-    parseZonesCompact,
     rectCells,
     roomCells,
     zoneCheck,
@@ -65,7 +64,7 @@ test("the lounge's monitored area (edge mask cleared cells) is x -200..+250, y 0
 });
 
 test("zones decode to the cells written for them (Table, Sofa, Armchair)", () => {
-    const zones = parseZones(last.configured_zones);
+    const zones = parseZones(last.native_zones);
     assert.deepEqual(zones.map((z) => z.id), [1, 2, 3]);
     const span = (z) => {
         const boxes = setCells(z.bits).map(cellBox);
@@ -77,7 +76,7 @@ test("zones decode to the cells written for them (Table, Sofa, Armchair)", () =>
 });
 
 test("the card's cell geometry agrees with the sensor's own zone for each reported target", () => {
-    const zones = new Map(parseZones(last.configured_zones).map((z) => [z.id, z.bits]));
+    const zones = new Map(parseZones(last.native_zones).map((z) => [z.id, z.bits]));
     let checked = 0;
     let agree = 0;
     for (const {payload} of fixtures) {
@@ -172,12 +171,25 @@ test("snapshot from a Zigbee2MQTT message", () => {
     assert.equal(s.targets.length, 3);
     assert.equal(s.zones.length, 3);
     assert.equal(typeof s.presence, "boolean");
-    assert.deepEqual(Object.keys(s.zoneState).sort(), ["1", "2", "3"]);
+    // Every zone endpoint answers (firmware 63), so there is state for zones 1-8; the zone list says 1-3 exist.
+    assert.deepEqual(Object.keys(s.zoneState).sort(), ["1", "2", "3", "4", "5", "6", "7", "8"]);
+    assert.ok(Object.values(s.zoneState).some((z) => z.occupied === true));
     const empty = snapshotFromPayload(last);
     assert.deepEqual(empty.targets, []);
     assert.equal(empty.presence, false);
     assert.equal(empty.zoneState[3].occupied, false);
     assert.equal(snapshotFromPayload({linkquality: 9}).targets, null); // tracking never on
+});
+
+test("zone state and settings come per endpoint, keyed by the zone it carries", () => {
+    const s = snapshotFromPayload({zone_id_3: 2, occupancy_3: true, human_count_3: 1, presence_sensitivity_3: "high", absence_timeout_3: 30, zone_id_4: 0, occupancy_4: true, zone_id_5: 9, zone_id_6: "1"});
+    assert.deepEqual(s.zoneState, {2: {occupied: true, count: 1}});
+    assert.deepEqual(s.zoneSettings, {2: {sensitivity: "high", timeout: 30}});
+    assert.deepEqual(s.zoneEndpoints, {2: 3});
+    const last8 = snapshotFromPayload(last);
+    assert.deepEqual(last8.zoneEndpoints, {1: 3, 2: 4, 3: 5, 4: 6, 5: 7, 6: 8, 7: 9, 8: 10});
+    assert.deepEqual(last8.zoneSettings[1], {sensitivity: "medium", timeout: 10});
+    assert.equal(snapshotFromPayload({}).zones, null); // no zone list read yet
 });
 
 test("snapshot from Home Assistant entities (the reduced view)", () => {
@@ -187,11 +199,19 @@ test("snapshot from Home Assistant entities (the reduced view)", () => {
         [ids.human_count]: {state: "2"},
         [ids.targets_xy]: {state: "0:120:175;2:-40:260"},
         [ids.edge_mask]: {state: last.edge_mask_hex},
-        [ids.zone_occupancy(1)]: {state: "on"},
-        [ids.zone_count(1)]: {state: "2"},
-        [ids.zone_occupancy(2)]: {state: "off"},
-        [ids.zone_occupancy(4)]: {state: "unknown"},
+        // Endpoint 3 carries zone 1, endpoint 4 zone 2; endpoint 6 is unknown, endpoint 5 has not said its zone.
+        [ids.zone_id(3)]: {state: "1"},
+        [ids.zone_occupancy(3)]: {state: "on"},
+        [ids.zone_count(3)]: {state: "2"},
+        [ids.zone_id(4)]: {state: "2"},
+        [ids.zone_occupancy(4)]: {state: "off"},
+        [ids.zone_occupancy(5)]: {state: "on"},
+        [ids.zone_id(6)]: {state: "4"},
+        [ids.zone_occupancy(6)]: {state: "unknown"},
     };
+    assert.equal(ids.zone_occupancy(3), "binary_sensor.fp400_lounge_occupancy_3");
+    assert.equal(ids.zone_count(3), "sensor.fp400_lounge_human_count_3");
+    assert.equal(ids.zone_id(3), "sensor.fp400_lounge_zone_id_3");
     const s = snapshotFromStates(states, ids);
     assert.equal(s.source, "entities");
     assert.equal(s.presence, true);
@@ -229,7 +249,7 @@ test("configuration", () => {
 /* ── Zone editor helpers ── */
 
 test("bitsToHex is the inverse of maskBits, for every mask in the fixtures", () => {
-    for (const hex of [last.edge_mask_hex, last.entry_exit_mask_hex, ...last.configured_zones.map((z) => z.mask_hex)]) {
+    for (const hex of [last.edge_mask_hex, last.entry_exit_mask_hex, ...last.native_zones.map((z) => z.mask_hex)]) {
         assert.equal(bitsToHex(maskBits(hex)), hex);
     }
     // A zone of rows 5-6, columns 9-10.
@@ -273,7 +293,7 @@ test("rectCells covers the rectangle between two cells in either order", () => {
 });
 
 test("zoneCheck: overlaps with other zones and cells outside the monitored area", () => {
-    const zones = parseZones(last.configured_zones);
+    const zones = parseZones(last.native_zones);
     const edge = maskBits(last.edge_mask_hex);
     const draft = new Uint8Array(CELLS);
     for (const i of rectCells(3 * COLS + 9, 6 * COLS + 10)) draft[i] = 1; // row 6, columns 9-10 are Armchair's
@@ -282,13 +302,6 @@ test("zoneCheck: overlaps with other zones and cells outside the monitored area"
     const outside = new Uint8Array(CELLS);
     outside[12 * COLS + 8] = outside[12 * COLS + 9] = 1; // row 12 is beyond the lounge's monitored area
     assert.deepEqual(zoneCheck(outside, zones, 4, edge), {cells: 2, overlaps: [], outside: 2});
-});
-
-test("snapshot carries zone settings and the sensor's zone limit", () => {
-    const s = snapshotFromPayload(last);
-    assert.deepEqual(s.zoneSettings[1], {sensitivity: "medium", timeout: 10});
-    assert.equal(s.maxZones, 8);
-    assert.equal(snapshotFromPayload({maximum_zones: 4}).maxZones, 4);
 });
 
 test("configuration: base topic and device name for bridge/logging", () => {
@@ -301,7 +314,7 @@ test("configuration: base topic and device name for bridge/logging", () => {
     assert.equal(normalizeConfig({topic: "a/b", zone_editor: false}).zone_editor, false);
 });
 
-/* ── Areas, compact zones, leaving targets (0.3.0) ── */
+/* ── Areas, leaving targets (0.3.0) ── */
 
 test("Fit to room: the cells at least half inside the outline are exactly the lounge's monitored area", () => {
     const c = normalizeConfig(lounge);
@@ -309,22 +322,6 @@ test("Fit to room: the cells at least half inside the outline are exactly the lo
     assert.equal(bitsToHex(invertBits(fitted)), last.edge_mask_hex);
     assert.equal(fitted.reduce((n, b) => n + b, 0), 81);
     assert.equal(roomCells(null).reduce((n, b) => n + b, 0), 0);
-});
-
-test("compact zones read back as the zone list the converter publishes", () => {
-    const zones = parseZonesCompact("1:4:0e000e000e;2:12:1c001c001c;3:13:7000700070;4!:0:00");
-    assert.deepEqual(zones.slice(0, 3).map((z) => z.hex), last.configured_zones.map((z) => z.mask_hex));
-    assert.deepEqual(zones.map((z) => [z.id, z.enabled]), [[1, true], [2, true], [3, true], [4, false]]);
-    assert.equal(zones[3].bits.reduce((n, b) => n + b, 0), 0);
-    assert.deepEqual(parseZonesCompact("none"), []);
-    for (const unknown of ["", "unknown", "unavailable", undefined, "1:0:0", "1:39:0000", "x"]) assert.equal(parseZonesCompact(unknown), null, String(unknown));
-});
-
-test("the reduced view draws zones from the compact entity", () => {
-    const ids = entityIds("dev");
-    const s = snapshotFromStates({[ids.zones_compact]: {state: "2:14:060006"}}, ids);
-    assert.deepEqual(s.zones.map((z) => z.id), [2]);
-    assert.equal(snapshotFromStates({[ids.zones_compact]: {state: ""}}, ids).zones, null); // never published yet
 });
 
 test("targets keep the leaving flag", () => {
@@ -428,16 +425,16 @@ test("the snapshot lists software zones only when the device publishes them", ()
 });
 
 test("settings: only the keys the device publishes; values compare as written", () => {
-    const s = snapshotFromPayload({...last, map_rotation: 30, forget_still_targets: 0, restore_status: "ok", learning_state: "accepted", learning_result_code: null});
+    const s = snapshotFromPayload({...last, map_rotation: 30, forget_still_targets: 0, restore_status: "ok"});
     for (const key of ["presence_sensitivity", "absence_timeout", "installation_mode", "installation_height", "ai_high_precision", "forget_still_targets"]) assert.ok(key in s.settings, key);
     // A map_rotation an older converter left in the device's state is not a setting of the card's.
     assert.equal("map_rotation" in s.settings, false);
+    // The zones' own settings (presence_sensitivity_N, absence_timeout_N) are not the room's.
+    assert.equal(Object.keys(s.settings).some((k) => /_\d+$/.test(k)), false);
     assert.equal(s.settings.presence_sensitivity, "high");
-    assert.deepEqual(s.learning, {state: "accepted", code: null});
     assert.deepEqual(s.restore, {status: "ok", error: ""});
     const bare = snapshotFromPayload({occupancy_1: true});
     assert.deepEqual(bare.settings, {});
-    assert.equal(bare.learning, null);
     assert.equal(bare.restore, null);
     assert.equal(sameSetting(45, 45), true);
     assert.equal(sameSetting("45", 45), true);
